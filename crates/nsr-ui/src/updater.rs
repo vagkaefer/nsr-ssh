@@ -1,7 +1,7 @@
-use std::sync::{Arc, Mutex};
 use serde::Deserialize;
+use std::sync::{Arc, Mutex};
 
-const REPO: &str = "vagnerkaefer/nsr-ssh";
+const REPO: &str = "vagkaefer/nsr-ssh";
 const CURRENT_VERSION: &str = env!("CARGO_PKG_VERSION");
 
 #[derive(Debug, Clone)]
@@ -43,14 +43,7 @@ async fn check_latest() -> Option<UpdateInfo> {
         .build()
         .ok()?;
 
-    let release: GithubRelease = client
-        .get(&url)
-        .send()
-        .await
-        .ok()?
-        .json()
-        .await
-        .ok()?;
+    let release: GithubRelease = client.get(&url).send().await.ok()?.json().await.ok()?;
 
     let tag = release.tag_name.trim_start_matches('v');
     let current = CURRENT_VERSION.trim_start_matches('v');
@@ -69,7 +62,11 @@ async fn check_latest() -> Option<UpdateInfo> {
 fn is_newer(latest: &str, current: &str) -> bool {
     fn parse(v: &str) -> [u32; 3] {
         let mut parts = v.splitn(3, '.').map(|p| p.parse::<u32>().unwrap_or(0));
-        [parts.next().unwrap_or(0), parts.next().unwrap_or(0), parts.next().unwrap_or(0)]
+        [
+            parts.next().unwrap_or(0),
+            parts.next().unwrap_or(0),
+            parts.next().unwrap_or(0),
+        ]
     }
     parse(latest) > parse(current)
 }
