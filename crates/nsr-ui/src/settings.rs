@@ -7,6 +7,8 @@ pub struct SettingsPanel {
     pub font_size: f32,
     pub scrollback_lines: usize,
     pub selected_theme_name: String,
+    /// Caminho da pasta de sync automático do vault (vazio = desativado)
+    pub sync_vault_path: String,
     active_section: Section,
 }
 
@@ -25,6 +27,7 @@ impl SettingsPanel {
             font_size: 14.0,
             scrollback_lines: 5_000,
             selected_theme_name: theme_name.to_string(),
+            sync_vault_path: String::new(),
             active_section: Section::Appearance,
         }
     }
@@ -120,7 +123,7 @@ impl SettingsPanel {
                                 match self.active_section {
                                     Section::Appearance => self.section_appearance(ui, current_theme),
                                     Section::Shortcuts  => section_shortcuts(ui),
-                                    Section::Ssh        => section_ssh(ui),
+                                    Section::Ssh        => self.section_ssh(ui),
                                     Section::Plugins    => section_plugins(ui),
                                 }
                             });
@@ -177,6 +180,73 @@ impl SettingsPanel {
         ui.add_space(Ds::SPACE_LG);
         info_box(ui, "Temas customizados: coloque arquivos .toml em ~/.config/nsr-ssh/themes/\nCtrl+Shift+S salva o conteúdo do terminal em arquivo.");
     }
+
+    fn section_ssh(&mut self, ui: &mut egui::Ui) {
+        section_title(ui, "Conexão SSH");
+
+        setting_row(ui, "Reconexão automática", "Tenta reconectar ao detectar queda na sessão", |ui| {
+            ui.label(RichText::new("✓ Ativada").color(Ds::GREEN).size(Ds::FONT_MD));
+        });
+        setting_row(ui, "Tentativas", "Número máximo de tentativas de reconexão", |ui| {
+            ui.label(RichText::new("3").color(Ds::TEXT_PRIMARY).size(Ds::FONT_MD));
+        });
+        setting_row(ui, "Intervalo entre tentativas", "Tempo de espera entre cada tentativa", |ui| {
+            ui.label(RichText::new("3 segundos").color(Ds::TEXT_PRIMARY).size(Ds::FONT_MD));
+        });
+        setting_row(ui, "Vault", "Hosts salvos em ~/.config/nsr-ssh/vault.json", |ui| {
+            ui.label(RichText::new("✓ Sincronizado com ~/.ssh/config").color(Ds::GREEN).size(Ds::FONT_SM));
+        });
+
+        ui.add_space(Ds::SPACE_LG);
+        section_title(ui, "Sincronização Automática");
+
+        ui.label(
+            RichText::new("Pasta de sync")
+                .color(Ds::TEXT_PRIMARY)
+                .size(Ds::FONT_MD),
+        );
+        ui.add_space(Ds::SPACE_XS);
+        ui.label(
+            RichText::new("Aponte para qualquer pasta gerenciada pelo Syncthing, Nextcloud, rclone, etc.\nO vault.json será lido/escrito automaticamente sempre que houver mudança.")
+                .color(Ds::TEXT_MUTED)
+                .size(Ds::FONT_SM),
+        );
+        ui.add_space(Ds::SPACE_SM);
+
+        ui.horizontal(|ui| {
+            ui.add(
+                egui::TextEdit::singleline(&mut self.sync_vault_path)
+                    .hint_text("Ex: ~/Nextcloud/nsr-ssh  (vazio = desativado)")
+                    .font(egui::FontId::proportional(Ds::FONT_SM))
+                    .desired_width(ui.available_width() - 80.0),
+            );
+            if ui
+                .add(
+                    egui::Button::new(RichText::new("…").color(Ds::TEXT_PRIMARY).size(Ds::FONT_MD))
+                        .fill(Ds::BG_SURFACE)
+                        .stroke(Stroke::new(1.0, Ds::BORDER))
+                        .corner_radius(Ds::R_SM),
+                )
+                .clicked()
+            {
+                if let Some(path) = rfd::FileDialog::new().pick_folder() {
+                    self.sync_vault_path = path.display().to_string();
+                }
+            }
+        });
+
+        if !self.sync_vault_path.is_empty() {
+            ui.add_space(Ds::SPACE_XS);
+            ui.label(
+                RichText::new(format!("Sincronizando com: {}/vault.json", self.sync_vault_path))
+                    .color(Ds::GREEN)
+                    .size(Ds::FONT_SM),
+            );
+        }
+
+        ui.add_space(Ds::SPACE_LG);
+        info_box(ui, "O NSR-SSH sincroniza automaticamente o vault com ~/.ssh/config ao salvar.\nAlterações manuais no ~/.ssh/config são detectadas e importadas automaticamente.");
+    }
 }
 
 fn section_shortcuts(ui: &mut egui::Ui) {
@@ -211,25 +281,6 @@ fn section_shortcuts(ui: &mut egui::Ui) {
     }
 }
 
-fn section_ssh(ui: &mut egui::Ui) {
-    section_title(ui, "Conexão SSH");
-
-    setting_row(ui, "Reconexão automática", "Tenta reconectar ao detectar queda na sessão", |ui| {
-        ui.label(RichText::new("✓ Ativada").color(Ds::GREEN).size(Ds::FONT_MD));
-    });
-    setting_row(ui, "Tentativas", "Número máximo de tentativas de reconexão", |ui| {
-        ui.label(RichText::new("3").color(Ds::TEXT_PRIMARY).size(Ds::FONT_MD));
-    });
-    setting_row(ui, "Intervalo entre tentativas", "Tempo de espera entre cada tentativa", |ui| {
-        ui.label(RichText::new("3 segundos").color(Ds::TEXT_PRIMARY).size(Ds::FONT_MD));
-    });
-    setting_row(ui, "Vault", "Hosts salvos em ~/.config/nsr-ssh/vault.json", |ui| {
-        ui.label(RichText::new("✓ Sincronizado com ~/.ssh/config").color(Ds::GREEN).size(Ds::FONT_SM));
-    });
-
-    ui.add_space(Ds::SPACE_LG);
-    info_box(ui, "O NSR-SSH sincroniza automaticamente o vault com ~/.ssh/config ao salvar.\nAlterações manuais no ~/.ssh/config são detectadas e importadas automaticamente.");
-}
 
 fn section_plugins(ui: &mut egui::Ui) {
     section_title(ui, "Plugins");

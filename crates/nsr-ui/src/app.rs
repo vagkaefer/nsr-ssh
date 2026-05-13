@@ -1,13 +1,13 @@
+use egui::epaint::CornerRadius;
+use egui::{Key, Modifiers, Pos2, Rect, RichText, Stroke, Vec2};
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime};
-use egui::{Key, Modifiers, Pos2, Rect, RichText, Stroke, Vec2};
-use egui::epaint::CornerRadius;
 use tokio::sync::{broadcast, mpsc};
 use uuid::Uuid;
 
 use nsr_core::{SessionEvent, SessionManager};
-use nsr_theme::{Theme, load_user_themes};
+use nsr_theme::{load_user_themes, Theme};
 use nsr_vault::{Host, VaultStore};
 
 #[derive(Debug, Clone, PartialEq)]
@@ -23,7 +23,7 @@ use crate::pane::{PaneTree, Tab};
 use crate::settings::SettingsPanel;
 use crate::tab_bar::{TabBar, TabBarAction};
 use crate::terminal_widget::{TerminalBuffer, TerminalWidgetResult};
-use crate::updater::{UpdateState, spawn_update_check};
+use crate::updater::{spawn_update_check, UpdateState};
 use crate::vault_panel::{VaultAction, VaultPanel};
 
 #[derive(Default)]
@@ -65,10 +65,14 @@ pub struct NsrApp {
     show_vault: bool,
     welcome_search: String,
     ssh_config_mtime: Option<SystemTime>,
-    dragging_tab: Option<Uuid>,      // tab_id sendo arrastado
+    dragging_tab: Option<Uuid>, // tab_id sendo arrastado
+    vault_visible_before_settings: bool,
     status_message: String,
     status_ok: bool,
     update_state: UpdateState,
+    // Sync automático do vault: mtime do arquivo na pasta de sync
+    sync_vault_mtime: Option<SystemTime>,
+    last_sync_check: Instant,
 }
 
 impl NsrApp {
@@ -102,7 +106,10 @@ impl NsrApp {
         let initial_mtime = vault_store.as_ref().and_then(|s| s.ssh_config_mtime());
 
         let themes = load_user_themes();
-        let theme = themes.into_iter().next().unwrap_or_else(nsr_theme::builtin::dracula);
+        let theme = themes
+            .into_iter()
+            .next()
+            .unwrap_or_else(nsr_theme::builtin::dracula);
         let theme_name = theme.name.clone();
 
         let rt_ref = Arc::clone(&rt);
@@ -130,9 +137,12 @@ impl NsrApp {
             show_vault: true,
             welcome_search: String::new(),
             dragging_tab: None,
+            vault_visible_before_settings: true,
             status_message: "Pronto".into(),
             status_ok: true,
             update_state,
+            sync_vault_mtime: None,
+            last_sync_check: Instant::now(),
         }
     }
 
@@ -150,7 +160,9 @@ impl NsrApp {
             Ok((session_id, output_rx)) => {
                 self.terminal_buffers.insert(
                     session_id,
-                    Arc::new(Mutex::new(TerminalBuffer::new(session_id, 220, 50, scrollback))),
+                    Arc::new(Mutex::new(TerminalBuffer::new(
+                        session_id, 220, 50, scrollback,
+                    ))),
                 );
                 self.output_receivers.insert(session_id, output_rx);
                 self.pane_states.insert(session_id, PaneState::Connecting);
@@ -183,7 +195,9 @@ impl NsrApp {
     }
 
     fn duplicate_tab(&mut self, tab_id: Uuid) {
-        let host_alias = self.tabs.iter()
+        let host_alias = self
+            .tabs
+            .iter()
             .find(|t| t.id == tab_id)
             .map(|t| t.host_alias.clone());
         if let Some(alias) = host_alias {
@@ -206,7 +220,9 @@ impl NsrApp {
                     if let Ok((new_sid, rx)) = rt.block_on(async { sm.connect(host, None).await }) {
                         self.terminal_buffers.insert(
                             new_sid,
-                            Arc::new(Mutex::new(TerminalBuffer::new(new_sid, 110, 50, scrollback))),
+                            Arc::new(Mutex::new(TerminalBuffer::new(
+                                new_sid, 110, 50, scrollback,
+                            ))),
                         );
                         self.output_receivers.insert(new_sid, rx);
                         let tree = std::mem::replace(
@@ -233,7 +249,9 @@ impl NsrApp {
                     if let Ok((new_sid, rx)) = rt.block_on(async { sm.connect(host, None).await }) {
                         self.terminal_buffers.insert(
                             new_sid,
-                            Arc::new(Mutex::new(TerminalBuffer::new(new_sid, 220, 25, scrollback))),
+                            Arc::new(Mutex::new(TerminalBuffer::new(
+                                new_sid, 220, 25, scrollback,
+                            ))),
                         );
                         self.output_receivers.insert(new_sid, rx);
                         let tree = std::mem::replace(
@@ -288,7 +306,9 @@ impl NsrApp {
     }
 
     fn check_ssh_config_changes(&mut self) {
-        let Some(ref store) = self.vault_store else { return };
+        let Some(ref store) = self.vault_store else {
+            return;
+        };
         let current_mtime = store.ssh_config_mtime();
         if current_mtime == self.ssh_config_mtime {
             return;
@@ -300,7 +320,8 @@ impl NsrApp {
                 let count = new_hosts.len();
                 self.hosts.extend(new_hosts);
                 self.persist_hosts();
-                self.status_message = format!("{} novo(s) host(s) importado(s) do ~/.ssh/config", count);
+                self.status_message =
+                    format!("{} novo(s) host(s) importado(s) do ~/.ssh/config", count);
                 self.status_ok = true;
             }
             Ok(_) => {
@@ -308,7 +329,11 @@ impl NsrApp {
                 // reimporta atualizações de hosts existentes pelo alias
                 if let Ok(imported) = store.import_from_ssh_config() {
                     for imported_host in imported {
-                        if let Some(existing) = self.hosts.iter_mut().find(|h| h.alias == imported_host.alias) {
+                        if let Some(existing) = self
+                            .hosts
+                            .iter_mut()
+                            .find(|h| h.alias == imported_host.alias)
+                        {
                             existing.hostname = imported_host.hostname;
                             existing.user = imported_host.user;
                             existing.port = imported_host.port;
@@ -332,13 +357,17 @@ impl NsrApp {
         self.last_latency_check = Instant::now();
 
         // Coleta (session_id, hostname, port) das sessões conectadas
-        let targets: Vec<(Uuid, String, u16)> = self.tabs.iter()
+        let targets: Vec<(Uuid, String, u16)> = self
+            .tabs
+            .iter()
             .flat_map(|tab| tab.pane_tree.sessions())
             .filter_map(|sid| {
                 if !matches!(self.pane_states.get(&sid), Some(PaneState::Connected)) {
                     return None;
                 }
-                let alias = self.tabs.iter()
+                let alias = self
+                    .tabs
+                    .iter()
                     .find(|t| t.pane_tree.sessions().contains(&sid))
                     .map(|t| t.host_alias.clone())?;
                 let host = self.hosts.iter().find(|h| h.alias == alias)?;
@@ -355,7 +384,8 @@ impl NsrApp {
                 let result = tokio::time::timeout(
                     Duration::from_secs(3),
                     tokio::net::TcpStream::connect(addr.as_str()),
-                ).await;
+                )
+                .await;
                 let ms = match result {
                     Ok(Ok(_)) => Some(start.elapsed().as_millis() as u32),
                     _ => None,
@@ -375,7 +405,9 @@ impl NsrApp {
                     match rx.try_recv() {
                         Ok(data) => {
                             if let Some(buf) = self.terminal_buffers.get(&sid) {
-                                if let Ok(mut b) = buf.lock() { b.process(&data); }
+                                if let Ok(mut b) = buf.lock() {
+                                    b.process(&data);
+                                }
                             }
                         }
                         Err(mpsc::error::TryRecvError::Empty) => break,
@@ -396,7 +428,10 @@ impl NsrApp {
                     self.status_ok = true;
                 }
                 Ok(SessionEvent::Disconnected { session_id }) => {
-                    let entry = self.pane_states.entry(session_id).or_insert(PaneState::Connecting);
+                    let entry = self
+                        .pane_states
+                        .entry(session_id)
+                        .or_insert(PaneState::Connecting);
                     if matches!(entry, PaneState::Connected | PaneState::Connecting) {
                         *entry = PaneState::Disconnected { error: None };
                     }
@@ -404,14 +439,24 @@ impl NsrApp {
                     self.status_message = "Desconectado".into();
                     self.status_ok = false;
                 }
-                Ok(SessionEvent::Error { session_id, message }) => {
-                    self.pane_states.insert(session_id, PaneState::Disconnected { error: Some(message.clone()) });
+                Ok(SessionEvent::Error {
+                    session_id,
+                    message,
+                }) => {
+                    self.pane_states.insert(
+                        session_id,
+                        PaneState::Disconnected {
+                            error: Some(message.clone()),
+                        },
+                    );
                     self.status_message = message;
                     self.status_ok = false;
                 }
                 Ok(SessionEvent::Output { session_id, data }) => {
                     if let Some(buf) = self.terminal_buffers.get(&session_id) {
-                        if let Ok(mut b) = buf.lock() { b.process(&data); }
+                        if let Ok(mut b) = buf.lock() {
+                            b.process(&data);
+                        }
                     }
                 }
                 Ok(_) => {}
@@ -436,7 +481,10 @@ impl NsrApp {
             PaneTree::Terminal(sid) => {
                 let sid = *sid;
                 let mut result = PaneResult::default();
-                let state = pane_states.get(&sid).cloned().unwrap_or(PaneState::Connecting);
+                let state = pane_states
+                    .get(&sid)
+                    .cloned()
+                    .unwrap_or(PaneState::Connecting);
 
                 match state {
                     PaneState::Disconnected { error } => {
@@ -469,12 +517,21 @@ impl NsrApp {
                                     toggle_recording,
                                 } = widget.show(ui);
 
-                                if resp.clicked() { result.new_active = Some(sid); }
-                                if let Some(text) = copy_text { result.copy_text = Some(text); }
-                                if paste_requested { result.paste_requested = Some(sid); }
-                                if save_content_requested { result.save_content = Some(sid); }
-                                if toggle_recording { result.toggle_recording = Some(sid); }
-
+                                if resp.clicked() {
+                                    result.new_active = Some(sid);
+                                }
+                                if let Some(text) = copy_text {
+                                    result.copy_text = Some(text);
+                                }
+                                if paste_requested {
+                                    result.paste_requested = Some(sid);
+                                }
+                                if save_content_requested {
+                                    result.save_content = Some(sid);
+                                }
+                                if toggle_recording {
+                                    result.toggle_recording = Some(sid);
+                                }
 
                                 if let Some((cols, rows)) = resize {
                                     let sm = session_manager.clone();
@@ -488,15 +545,23 @@ impl NsrApp {
                                         for event in &i.events {
                                             let data: Vec<u8> = match event {
                                                 egui::Event::Text(text) => {
-                                                    if modifiers_held.ctrl { vec![] }
-                                                    else { text.as_bytes().to_vec() }
+                                                    if modifiers_held.ctrl {
+                                                        vec![]
+                                                    } else {
+                                                        text.as_bytes().to_vec()
+                                                    }
                                                 }
-                                                egui::Event::Key { key, pressed: true, modifiers, .. } => {
-                                                    key_to_bytes(*key, *modifiers)
-                                                }
+                                                egui::Event::Key {
+                                                    key,
+                                                    pressed: true,
+                                                    modifiers,
+                                                    ..
+                                                } => key_to_bytes(*key, *modifiers),
                                                 _ => vec![],
                                             };
-                                            if !data.is_empty() { inputs.push(data); }
+                                            if !data.is_empty() {
+                                                inputs.push(data);
+                                            }
                                         }
                                     });
                                     for data in inputs {
@@ -524,13 +589,28 @@ impl NsrApp {
                     ui.spacing_mut().item_spacing = Vec2::ZERO;
 
                     let left_resp = ui.allocate_ui(Vec2::new(left_w, avail.y), |ui| {
-                        Self::render_pane_tree(ui, left, active_pane, terminal_buffers, pane_states, font_size, session_manager, rt)
+                        Self::render_pane_tree(
+                            ui,
+                            left,
+                            active_pane,
+                            terminal_buffers,
+                            pane_states,
+                            font_size,
+                            session_manager,
+                            rt,
+                        )
                     });
                     merge_pane_result(&mut result, left_resp.inner);
 
-                    let (sep_rect, sep_resp) = ui.allocate_exact_size(Vec2::new(SEP, avail.y), egui::Sense::drag());
-                    let sep_color = if sep_resp.hovered() || sep_resp.dragged() { Ds::ACCENT } else { Ds::BORDER };
-                    ui.painter().rect_filled(sep_rect, CornerRadius::ZERO, sep_color);
+                    let (sep_rect, sep_resp) =
+                        ui.allocate_exact_size(Vec2::new(SEP, avail.y), egui::Sense::drag());
+                    let sep_color = if sep_resp.hovered() || sep_resp.dragged() {
+                        Ds::ACCENT
+                    } else {
+                        Ds::BORDER
+                    };
+                    ui.painter()
+                        .rect_filled(sep_rect, CornerRadius::ZERO, sep_color);
                     if sep_resp.hovered() || sep_resp.dragged() {
                         ui.ctx().set_cursor_icon(egui::CursorIcon::ResizeHorizontal);
                     }
@@ -539,7 +619,16 @@ impl NsrApp {
                     }
 
                     let right_resp = ui.allocate_ui(Vec2::new(right_w, avail.y), |ui| {
-                        Self::render_pane_tree(ui, right, active_pane, terminal_buffers, pane_states, font_size, session_manager, rt)
+                        Self::render_pane_tree(
+                            ui,
+                            right,
+                            active_pane,
+                            terminal_buffers,
+                            pane_states,
+                            font_size,
+                            session_manager,
+                            rt,
+                        )
                     });
                     merge_pane_result(&mut result, right_resp.inner);
                 });
@@ -555,13 +644,28 @@ impl NsrApp {
                 let mut result = PaneResult::default();
 
                 let top_resp = ui.allocate_ui(Vec2::new(avail.x, top_h), |ui| {
-                    Self::render_pane_tree(ui, top, active_pane, terminal_buffers, pane_states, font_size, session_manager, rt)
+                    Self::render_pane_tree(
+                        ui,
+                        top,
+                        active_pane,
+                        terminal_buffers,
+                        pane_states,
+                        font_size,
+                        session_manager,
+                        rt,
+                    )
                 });
                 merge_pane_result(&mut result, top_resp.inner);
 
-                let (sep_rect, sep_resp) = ui.allocate_exact_size(Vec2::new(avail.x, SEP), egui::Sense::drag());
-                let sep_color = if sep_resp.hovered() || sep_resp.dragged() { Ds::ACCENT } else { Ds::BORDER };
-                ui.painter().rect_filled(sep_rect, CornerRadius::ZERO, sep_color);
+                let (sep_rect, sep_resp) =
+                    ui.allocate_exact_size(Vec2::new(avail.x, SEP), egui::Sense::drag());
+                let sep_color = if sep_resp.hovered() || sep_resp.dragged() {
+                    Ds::ACCENT
+                } else {
+                    Ds::BORDER
+                };
+                ui.painter()
+                    .rect_filled(sep_rect, CornerRadius::ZERO, sep_color);
                 if sep_resp.hovered() || sep_resp.dragged() {
                     ui.ctx().set_cursor_icon(egui::CursorIcon::ResizeVertical);
                 }
@@ -570,7 +674,16 @@ impl NsrApp {
                 }
 
                 let bot_resp = ui.allocate_ui(Vec2::new(avail.x, bot_h), |ui| {
-                    Self::render_pane_tree(ui, bottom, active_pane, terminal_buffers, pane_states, font_size, session_manager, rt)
+                    Self::render_pane_tree(
+                        ui,
+                        bottom,
+                        active_pane,
+                        terminal_buffers,
+                        pane_states,
+                        font_size,
+                        session_manager,
+                        rt,
+                    )
                 });
                 merge_pane_result(&mut result, bot_resp.inner);
 
@@ -614,7 +727,167 @@ impl NsrApp {
             VaultAction::Edit(host) => {
                 self.connect_dialog.open_with_host(&host);
             }
-            VaultAction::Export | VaultAction::Import => {}
+            VaultAction::Export => {
+                self.export_vault();
+            }
+            VaultAction::Import => {
+                self.import_vault();
+            }
+        }
+    }
+
+    fn export_vault(&mut self) {
+        use nsr_vault::export_json;
+        match export_json(&self.hosts) {
+            Ok(json) => {
+                let dialog = rfd::FileDialog::new()
+                    .set_file_name("vault.json")
+                    .add_filter("JSON", &["json"]);
+                if let Some(path) = dialog.save_file() {
+                    match std::fs::write(&path, &json) {
+                        Ok(()) => {
+                            self.status_message = format!("Vault exportado para {}", path.display());
+                            self.status_ok = true;
+                        }
+                        Err(e) => {
+                            self.status_message = format!("Erro ao exportar: {}", e);
+                            self.status_ok = false;
+                        }
+                    }
+                }
+            }
+            Err(e) => {
+                self.status_message = format!("Erro ao serializar vault: {}", e);
+                self.status_ok = false;
+            }
+        }
+    }
+
+    fn import_vault(&mut self) {
+        use nsr_vault::import_json;
+        let dialog = rfd::FileDialog::new().add_filter("JSON", &["json"]);
+        if let Some(path) = dialog.pick_file() {
+            match std::fs::read_to_string(&path) {
+                Ok(json) => match import_json(&json) {
+                    Ok(imported) => {
+                        let mut added = 0;
+                        for host in imported {
+                            if !self.hosts.iter().any(|h| h.id == host.id || h.alias == host.alias) {
+                                self.hosts.push(host);
+                                added += 1;
+                            }
+                        }
+                        self.persist_hosts();
+                        self.status_message = format!("{} host(s) importado(s) de {}", added, path.display());
+                        self.status_ok = true;
+                    }
+                    Err(e) => {
+                        self.status_message = format!("Erro ao ler JSON: {}", e);
+                        self.status_ok = false;
+                    }
+                },
+                Err(e) => {
+                    self.status_message = format!("Erro ao abrir arquivo: {}", e);
+                    self.status_ok = false;
+                }
+            }
+        }
+    }
+
+    fn check_vault_sync(&mut self) {
+        const INTERVAL: Duration = Duration::from_secs(3);
+        if self.last_sync_check.elapsed() < INTERVAL {
+            return;
+        }
+        self.last_sync_check = Instant::now();
+
+        let sync_path = self.settings.sync_vault_path.trim().to_string();
+        if sync_path.is_empty() {
+            return;
+        }
+
+        // Expande ~ manualmente
+        let sync_dir = if sync_path.starts_with('~') {
+            if let Some(home) = dirs::home_dir() {
+                home.join(&sync_path[2..])
+            } else {
+                return;
+            }
+        } else {
+            std::path::PathBuf::from(&sync_path)
+        };
+
+        let sync_file = sync_dir.join("vault.json");
+
+        // Lê mtime
+        let mtime = std::fs::metadata(&sync_file).ok().and_then(|m| m.modified().ok());
+        if mtime == self.sync_vault_mtime {
+            return;
+        }
+
+        // Mudou ou primeira vez — tenta importar
+        let prev_mtime = self.sync_vault_mtime;
+        self.sync_vault_mtime = mtime;
+
+        if mtime.is_none() {
+            // Arquivo não existe → escreve vault local lá
+            self.write_sync_vault(&sync_file);
+            return;
+        }
+
+        if prev_mtime.is_none() {
+            // Primeira detecção do arquivo → importa sem sobrescrever
+        }
+
+        match std::fs::read_to_string(&sync_file) {
+            Ok(json) => match nsr_vault::import_json(&json) {
+                Ok(remote_hosts) => {
+                    let mut added = 0;
+                    let mut updated = 0;
+                    for remote in remote_hosts {
+                        if let Some(local) = self.hosts.iter_mut().find(|h| h.id == remote.id) {
+                            // Mesmo ID — atualiza se o remote for mais recente (sem timestamp,
+                            // adotamos remote como autoridade quando o arquivo muda externamente)
+                            if local.alias != remote.alias
+                                || local.hostname != remote.hostname
+                                || local.user != remote.user
+                                || local.port != remote.port
+                            {
+                                *local = remote;
+                                updated += 1;
+                            }
+                        } else if !self.hosts.iter().any(|h| h.alias == remote.alias) {
+                            self.hosts.push(remote);
+                            added += 1;
+                        }
+                    }
+                    if added > 0 || updated > 0 {
+                        self.persist_hosts();
+                        // Após salvar localmente, escreve de volta para sync (inclui hosts locais extras)
+                        self.write_sync_vault(&sync_file);
+                        self.status_message = format!(
+                            "Sync: +{} novo(s), {} atualizado(s)",
+                            added, updated
+                        );
+                        self.status_ok = true;
+                    }
+                }
+                Err(_) => {} // JSON inválido — ignora silenciosamente
+            },
+            Err(_) => {}
+        }
+    }
+
+    fn write_sync_vault(&mut self, path: &std::path::Path) {
+        use nsr_vault::export_json;
+        if let Some(parent) = path.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        if let Ok(json) = export_json(&self.hosts) {
+            if let Ok(()) = std::fs::write(path, &json) {
+                // Atualiza mtime para não disparar reimport da própria escrita
+                self.sync_vault_mtime = std::fs::metadata(path).ok().and_then(|m| m.modified().ok());
+            }
         }
     }
 
@@ -633,11 +906,23 @@ impl NsrApp {
                 }
             }
         }
+        // Propaga para a pasta de sync se configurada
+        let sync_path = self.settings.sync_vault_path.trim().to_string();
+        if !sync_path.is_empty() {
+            let sync_dir = if sync_path.starts_with('~') {
+                dirs::home_dir().map(|h| h.join(&sync_path[2..])).unwrap_or_default()
+            } else {
+                std::path::PathBuf::from(&sync_path)
+            };
+            let sync_file = sync_dir.join("vault.json");
+            self.write_sync_vault(&sync_file);
+        }
     }
 
     fn render_connecting(ui: &mut egui::Ui) {
         let rect = ui.available_rect_before_wrap();
-        ui.painter().rect_filled(rect, egui::epaint::CornerRadius::ZERO, Ds::BG_BASE);
+        ui.painter()
+            .rect_filled(rect, egui::epaint::CornerRadius::ZERO, Ds::BG_BASE);
         ui.centered_and_justified(|ui| {
             ui.vertical_centered(|ui| {
                 ui.add_space(rect.height() * 0.3);
@@ -645,28 +930,40 @@ impl NsrApp {
                 let t = ui.input(|i| i.time) as f32;
                 let radius = 18.0 + (t * 2.0).sin() * 3.0;
                 let center = ui.cursor().center_top() + egui::Vec2::new(0.0, 30.0);
-                ui.painter().circle_stroke(
-                    center,
-                    radius,
-                    egui::Stroke::new(2.5, Ds::ACCENT),
-                );
+                ui.painter()
+                    .circle_stroke(center, radius, egui::Stroke::new(2.5, Ds::ACCENT));
                 ui.painter().circle_filled(
                     center + egui::Vec2::new((t * 2.5).cos() * radius, (t * 2.5).sin() * radius),
                     4.0,
                     Ds::ACCENT,
                 );
                 ui.add_space(60.0);
-                ui.label(RichText::new("Conectando...").color(Ds::TEXT_PRIMARY).size(18.0).strong());
+                ui.label(
+                    RichText::new("Conectando...")
+                        .color(Ds::TEXT_PRIMARY)
+                        .size(18.0)
+                        .strong(),
+                );
                 ui.add_space(Ds::SPACE_SM);
-                ui.label(RichText::new("Estabelecendo sessão SSH").color(Ds::TEXT_MUTED).size(Ds::FONT_MD));
+                ui.label(
+                    RichText::new("Estabelecendo sessão SSH")
+                        .color(Ds::TEXT_MUTED)
+                        .size(Ds::FONT_MD),
+                );
                 ui.ctx().request_repaint();
             });
         });
     }
 
-    fn render_disconnected(ui: &mut egui::Ui, sid: Uuid, error: Option<&str>, result: &mut PaneResult) {
+    fn render_disconnected(
+        ui: &mut egui::Ui,
+        sid: Uuid,
+        error: Option<&str>,
+        result: &mut PaneResult,
+    ) {
         let rect = ui.available_rect_before_wrap();
-        ui.painter().rect_filled(rect, egui::epaint::CornerRadius::ZERO, Ds::BG_BASE);
+        ui.painter()
+            .rect_filled(rect, egui::epaint::CornerRadius::ZERO, Ds::BG_BASE);
 
         ui.centered_and_justified(|ui| {
             ui.vertical_centered(|ui| {
@@ -674,10 +971,17 @@ impl NsrApp {
 
                 // Ícone
                 let icon_rect = egui::Rect::from_center_size(
-                    egui::Pos2::new(ui.available_rect_before_wrap().center().x, ui.cursor().top() + 36.0),
+                    egui::Pos2::new(
+                        ui.available_rect_before_wrap().center().x,
+                        ui.cursor().top() + 36.0,
+                    ),
                     egui::Vec2::splat(64.0),
                 );
-                ui.painter().rect_filled(icon_rect, egui::epaint::CornerRadius::same(16), Ds::BG_SURFACE);
+                ui.painter().rect_filled(
+                    icon_rect,
+                    egui::epaint::CornerRadius::same(16),
+                    Ds::BG_SURFACE,
+                );
                 ui.painter().rect_stroke(
                     icon_rect,
                     egui::epaint::CornerRadius::same(16),
@@ -694,8 +998,17 @@ impl NsrApp {
                 ui.add_space(76.0);
 
                 // Título
-                let title = if error.is_some() { "Falha na Conexão" } else { "Sessão Encerrada" };
-                ui.label(RichText::new(title).color(Ds::TEXT_PRIMARY).size(22.0).strong());
+                let title = if error.is_some() {
+                    "Falha na Conexão"
+                } else {
+                    "Sessão Encerrada"
+                };
+                ui.label(
+                    RichText::new(title)
+                        .color(Ds::TEXT_PRIMARY)
+                        .size(22.0)
+                        .strong(),
+                );
                 ui.add_space(Ds::SPACE_XS);
 
                 // Mensagem de erro ou descrição genérica
@@ -713,7 +1026,10 @@ impl NsrApp {
 
                     // Botão Reconectar
                     let reconnect_btn = egui::Button::new(
-                        RichText::new("Reconectar").color(Ds::BG_BASE).size(Ds::FONT_MD).strong()
+                        RichText::new("Reconectar")
+                            .color(Ds::BG_BASE)
+                            .size(Ds::FONT_MD)
+                            .strong(),
                     )
                     .fill(Ds::ACCENT)
                     .stroke(egui::Stroke::NONE)
@@ -728,7 +1044,9 @@ impl NsrApp {
 
                     // Botão Fechar
                     let close_btn = egui::Button::new(
-                        RichText::new("Fechar Aba").color(Ds::TEXT_PRIMARY).size(Ds::FONT_MD)
+                        RichText::new("Fechar Aba")
+                            .color(Ds::TEXT_PRIMARY)
+                            .size(Ds::FONT_MD),
                     )
                     .fill(Ds::BG_SURFACE)
                     .stroke(egui::Stroke::new(1.0, Ds::BORDER))
@@ -744,13 +1062,19 @@ impl NsrApp {
     }
 
     fn detach_active_pane(&mut self) {
-        let Some(tab_id) = self.active_tab else { return };
-        let Some(tab_idx) = self.tabs.iter().position(|t| t.id == tab_id) else { return };
+        let Some(tab_id) = self.active_tab else {
+            return;
+        };
+        let Some(tab_idx) = self.tabs.iter().position(|t| t.id == tab_id) else {
+            return;
+        };
         let active_pane = self.tabs[tab_idx].active_pane;
 
         // Só faz sentido se o tab tem split (mais de um pane)
         let sessions = self.tabs[tab_idx].pane_tree.sessions();
-        if sessions.len() <= 1 { return; }
+        if sessions.len() <= 1 {
+            return;
+        }
 
         // Remove o pane da árvore atual
         let old_tree = std::mem::replace(
@@ -766,7 +1090,9 @@ impl NsrApp {
         }
 
         // Cria nova aba com esse pane
-        let host_alias = self.hosts.iter()
+        let host_alias = self
+            .hosts
+            .iter()
             .find(|_h| self.terminal_buffers.contains_key(&active_pane))
             .map(|h| h.alias.clone())
             .unwrap_or_else(|| format!("pane-{}", &active_pane.to_string()[..4]));
@@ -801,7 +1127,9 @@ impl NsrApp {
         match rt.block_on(async { sm.connect(host.clone(), None).await }) {
             Ok((new_sid, output_rx)) => {
                 // Reutiliza o buffer existente (ou cria novo)
-                let buf = Arc::new(Mutex::new(TerminalBuffer::new(new_sid, 220, 50, scrollback)));
+                let buf = Arc::new(Mutex::new(TerminalBuffer::new(
+                    new_sid, 220, 50, scrollback,
+                )));
                 self.terminal_buffers.remove(&old_sid);
                 self.terminal_buffers.insert(new_sid, buf);
                 self.output_receivers.insert(new_sid, output_rx);
@@ -819,9 +1147,12 @@ impl NsrApp {
                 self.status_ok = true;
             }
             Err(e) => {
-                self.pane_states.insert(old_sid, PaneState::Disconnected {
-                    error: Some(format!("Reconexão falhou: {}", e)),
-                });
+                self.pane_states.insert(
+                    old_sid,
+                    PaneState::Disconnected {
+                        error: Some(format!("Reconexão falhou: {}", e)),
+                    },
+                );
                 self.status_message = format!("Erro ao reconectar: {}", e);
                 self.status_ok = false;
             }
@@ -894,6 +1225,27 @@ impl NsrApp {
         }
     }
 
+    fn open_settings(&mut self) {
+        if !self.settings.open {
+            self.vault_visible_before_settings = self.show_vault;
+            self.show_vault = false;
+            self.settings.open = true;
+        }
+    }
+
+    fn close_settings(&mut self) {
+        self.settings.open = false;
+        self.show_vault = self.vault_visible_before_settings;
+    }
+
+    fn open_settings_toggle(&mut self) {
+        if self.settings.open {
+            self.close_settings();
+        } else {
+            self.open_settings();
+        }
+    }
+
     fn show_welcome(&mut self, ui: &mut egui::Ui) {
         let avail = ui.available_rect_before_wrap();
 
@@ -906,7 +1258,8 @@ impl NsrApp {
                 Pos2::new(avail.center().x, ui.cursor().top() + 32.0),
                 Vec2::new(56.0, 56.0),
             );
-            ui.painter().rect_filled(logo_rect, CornerRadius::same(14), Ds::ACCENT_DIM);
+            ui.painter()
+                .rect_filled(logo_rect, CornerRadius::same(14), Ds::ACCENT_DIM);
             ui.painter().text(
                 logo_rect.center(),
                 egui::Align2::CENTER_CENTER,
@@ -916,9 +1269,18 @@ impl NsrApp {
             );
             ui.add_space(64.0);
 
-            ui.label(RichText::new("NSR-SSH").size(28.0).color(Ds::TEXT_PRIMARY).strong());
+            ui.label(
+                RichText::new("NSR-SSH")
+                    .size(28.0)
+                    .color(Ds::TEXT_PRIMARY)
+                    .strong(),
+            );
             ui.add_space(4.0);
-            ui.label(RichText::new("No Subscription Required").size(Ds::FONT_MD).color(Ds::TEXT_MUTED));
+            ui.label(
+                RichText::new("No Subscription Required")
+                    .size(Ds::FONT_MD)
+                    .color(Ds::TEXT_MUTED),
+            );
             ui.add_space(Ds::SPACE_LG);
 
             // ── Quick actions ─────────────────────────────────────────────
@@ -939,7 +1301,7 @@ impl NsrApp {
                 }
                 ui.add_space(gap);
                 if quick_action_card(ui, "⚙", "Configurações", "Ctrl+,", card_w).clicked() {
-                    self.settings.open = true;
+                    self.open_settings();
                 }
             });
 
@@ -953,7 +1315,12 @@ impl NsrApp {
 
             ui.horizontal(|ui| {
                 ui.add_space(Ds::SPACE_LG);
-                ui.label(RichText::new("HOSTS SALVOS").color(Ds::TEXT_MUTED).size(Ds::FONT_XS).strong());
+                ui.label(
+                    RichText::new("HOSTS SALVOS")
+                        .color(Ds::TEXT_MUTED)
+                        .size(Ds::FONT_XS)
+                        .strong(),
+                );
             });
             ui.add_space(Ds::SPACE_XS);
 
@@ -965,16 +1332,23 @@ impl NsrApp {
                         .hint_text("🔍  buscar hosts...")
                         .font(egui::FontId::proportional(Ds::FONT_SM))
                         .desired_width(320.0)
-                        .margin(egui::Margin::symmetric(Ds::SPACE_SM as i8, Ds::SPACE_XS as i8)),
+                        .margin(egui::Margin::symmetric(
+                            Ds::SPACE_SM as i8,
+                            Ds::SPACE_XS as i8,
+                        )),
                 );
             });
             ui.add_space(Ds::SPACE_SM);
 
             let query = self.welcome_search.to_lowercase();
-            let filtered: Vec<_> = self.hosts.iter()
-                .filter(|h| query.is_empty()
-                    || h.alias.to_lowercase().contains(&query)
-                    || h.hostname.to_lowercase().contains(&query))
+            let filtered: Vec<_> = self
+                .hosts
+                .iter()
+                .filter(|h| {
+                    query.is_empty()
+                        || h.alias.to_lowercase().contains(&query)
+                        || h.hostname.to_lowercase().contains(&query)
+                })
                 .cloned()
                 .collect();
 
@@ -988,14 +1362,24 @@ impl NsrApp {
 
                             // Aloca área com sense para capturar cliques
                             let desired = Vec2::new(ui.available_width() - Ds::SPACE_LG, 36.0);
-                            let (rect, resp) = ui.allocate_exact_size(desired, egui::Sense::click());
+                            let (rect, resp) =
+                                ui.allocate_exact_size(desired, egui::Sense::click());
 
                             if ui.is_rect_visible(rect) {
                                 let hovered = resp.hovered();
-                                let fill = if hovered { Ds::BG_ACTIVE } else { Ds::BG_SURFACE };
+                                let fill = if hovered {
+                                    Ds::BG_ACTIVE
+                                } else {
+                                    Ds::BG_SURFACE
+                                };
                                 let border = if hovered { Ds::ACCENT } else { Ds::BORDER };
                                 ui.painter().rect_filled(rect, Ds::R_SM, fill);
-                                ui.painter().rect_stroke(rect, Ds::R_SM, Stroke::new(1.0, border), egui::StrokeKind::Inside);
+                                ui.painter().rect_stroke(
+                                    rect,
+                                    Ds::R_SM,
+                                    Stroke::new(1.0, border),
+                                    egui::StrokeKind::Inside,
+                                );
 
                                 // ">_" ícone
                                 ui.painter().text(
@@ -1014,7 +1398,8 @@ impl NsrApp {
                                     Ds::TEXT_PRIMARY,
                                 );
                                 // user@host:port
-                                let conn_str = format!("{}@{}:{}", host.user, host.hostname, host.port);
+                                let conn_str =
+                                    format!("{}@{}:{}", host.user, host.hostname, host.port);
                                 ui.painter().text(
                                     Pos2::new(rect.right() - 8.0, rect.center().y),
                                     egui::Align2::RIGHT_CENTER,
@@ -1042,13 +1427,23 @@ impl eframe::App for NsrApp {
         self.process_session_events();
         self.drain_output_receivers();
         self.check_ssh_config_changes();
+        self.check_vault_sync();
         self.update_latencies();
 
         Ds::apply_global_visuals(&ctx);
 
         // Atalhos globais
-        let (close_pane, open_new, toggle_vault, toggle_settings, split_h, split_v, next_tab, prev_tab) =
-            ctx.input_mut(|i| (
+        let (
+            close_pane,
+            open_new,
+            toggle_vault,
+            toggle_settings,
+            split_h,
+            split_v,
+            next_tab,
+            prev_tab,
+        ) = ctx.input_mut(|i| {
+            (
                 i.consume_key(Modifiers::CTRL, Key::W),
                 i.consume_key(Modifiers::CTRL, Key::T),
                 i.consume_key(Modifiers::CTRL, Key::B),
@@ -1057,14 +1452,27 @@ impl eframe::App for NsrApp {
                 i.consume_key(Modifiers::CTRL | Modifiers::SHIFT, Key::Minus),
                 i.consume_key(Modifiers::CTRL, Key::Tab),
                 i.consume_key(Modifiers::CTRL | Modifiers::SHIFT, Key::Tab),
-            ));
+            )
+        });
 
-        if close_pane { self.close_active_pane(); }
-        if open_new { self.connect_dialog.open_blank(); }
-        if toggle_vault { self.show_vault = !self.show_vault; }
-        if toggle_settings { self.settings.open = !self.settings.open; }
-        if split_h { self.split_active_h(); }
-        if split_v { self.split_active_v(); }
+        if close_pane {
+            self.close_active_pane();
+        }
+        if open_new {
+            self.connect_dialog.open_blank();
+        }
+        if toggle_vault {
+            self.show_vault = !self.show_vault;
+        }
+        if toggle_settings {
+            self.open_settings_toggle();
+        }
+        if split_h {
+            self.split_active_h();
+        }
+        if split_v {
+            self.split_active_v();
+        }
         if next_tab {
             if let Some(id) = self.active_tab {
                 if let Some(pos) = self.tabs.iter().position(|t| t.id == id) {
@@ -1076,7 +1484,11 @@ impl eframe::App for NsrApp {
         if prev_tab {
             if let Some(id) = self.active_tab {
                 if let Some(pos) = self.tabs.iter().position(|t| t.id == id) {
-                    let prev = if pos == 0 { self.tabs.len() - 1 } else { pos - 1 };
+                    let prev = if pos == 0 {
+                        self.tabs.len() - 1
+                    } else {
+                        pos - 1
+                    };
                     self.active_tab = Some(self.tabs[prev].id);
                 }
             }
@@ -1092,14 +1504,18 @@ impl eframe::App for NsrApp {
                         TabBarAction::Close(id) => self.close_tab(id),
                         TabBarAction::New => self.connect_dialog.open_blank(),
                         TabBarAction::Duplicate(id) => self.duplicate_tab(id),
-                        TabBarAction::OpenSettings => self.settings.open = true,
+                        TabBarAction::OpenSettings => self.open_settings(),
                         TabBarAction::SplitH(_) => self.split_active_h(),
                         TabBarAction::SplitV(_) => self.split_active_v(),
                         TabBarAction::StartDrag(id) => self.dragging_tab = Some(id),
                         TabBarAction::EndDrag => { /* handled by CentralPanel drop logic */ }
                         TabBarAction::DetachPane(_) => self.detach_active_pane(),
-                        TabBarAction::CloseWindow => ctx.send_viewport_cmd(egui::ViewportCommand::Close),
-                        TabBarAction::Minimize => ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(true)),
+                        TabBarAction::CloseWindow => {
+                            ctx.send_viewport_cmd(egui::ViewportCommand::Close)
+                        }
+                        TabBarAction::Minimize => {
+                            ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(true))
+                        }
                         TabBarAction::MaximizeToggle => {
                             let is_max = ctx.input(|i| i.viewport().maximized.unwrap_or(false));
                             ctx.send_viewport_cmd(egui::ViewportCommand::Maximized(!is_max));
@@ -1119,7 +1535,8 @@ impl eframe::App for NsrApp {
             .exact_size(Ds::STATUS_H)
             .show(&ctx, |ui| {
                 let rect = ui.available_rect_before_wrap();
-                ui.painter().rect_filled(rect, CornerRadius::ZERO, Ds::BG_PANEL);
+                ui.painter()
+                    .rect_filled(rect, CornerRadius::ZERO, Ds::BG_PANEL);
                 ui.painter().line_segment(
                     [rect.left_top(), rect.right_top()],
                     Stroke::new(1.0, Ds::BORDER),
@@ -1133,7 +1550,11 @@ impl eframe::App for NsrApp {
                         dot_color,
                     );
                     ui.add_space(12.0);
-                    ui.label(RichText::new(&self.status_message).size(Ds::FONT_SM).color(Ds::TEXT_SECONDARY));
+                    ui.label(
+                        RichText::new(&self.status_message)
+                            .size(Ds::FONT_SM)
+                            .color(Ds::TEXT_SECONDARY),
+                    );
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                         ui.add_space(Ds::SPACE_SM);
 
@@ -1143,67 +1564,136 @@ impl eframe::App for NsrApp {
                                 let url = info.release_url.clone();
                                 let label = format!("Atualizar para {}", info.latest_version);
                                 let badge = egui::Button::new(
-                                    RichText::new(label).size(Ds::FONT_SM).color(Ds::BG_BASE).strong(),
+                                    RichText::new(label)
+                                        .size(Ds::FONT_SM)
+                                        .color(Ds::BG_BASE)
+                                        .strong(),
                                 )
                                 .fill(Ds::ACCENT)
                                 .stroke(egui::Stroke::NONE)
                                 .corner_radius(Ds::R_SM);
-                                if ui.add(badge).on_hover_text("Abrir página de releases no GitHub").clicked() {
+                                if ui
+                                    .add(badge)
+                                    .on_hover_text("Abrir página de releases no GitHub")
+                                    .clicked()
+                                {
                                     let _ = open::that(&url);
                                 }
                                 ui.add_space(Ds::SPACE_SM);
                             }
                         }
 
-                        ui.label(RichText::new(format!("{} sessões  •  {} hosts", self.tabs.len(), self.hosts.len())).size(Ds::FONT_SM).color(Ds::TEXT_MUTED));
+                        ui.label(
+                            RichText::new(format!(
+                                "{} sessões  •  {} hosts",
+                                self.tabs.len(),
+                                self.hosts.len()
+                            ))
+                            .size(Ds::FONT_SM)
+                            .color(Ds::TEXT_MUTED),
+                        );
                         // Stats da sessão ativa
                         if let Some(active_id) = self.active_tab {
                             if let Some(tab) = self.tabs.iter().find(|t| t.id == active_id) {
                                 let active_pane = tab.active_pane;
 
                                 // Latência + IP do servidor
-                                if let Some(host) = self.hosts.iter().find(|h| h.alias == tab.host_alias) {
+                                if let Some(host) =
+                                    self.hosts.iter().find(|h| h.alias == tab.host_alias)
+                                {
                                     let ip = host.hostname.clone();
-                                    let lat_entry = self.latency_ms.lock().ok()
+                                    let lat_entry = self
+                                        .latency_ms
+                                        .lock()
+                                        .ok()
                                         .and_then(|m| m.get(&active_pane).copied());
 
                                     // Latência
                                     match lat_entry {
                                         Some(Some(ms)) => {
                                             let color = match ms {
-                                                0..=50   => Ds::GREEN,
+                                                0..=50 => Ds::GREEN,
                                                 51..=150 => Ds::YELLOW,
-                                                _        => Ds::RED,
+                                                _ => Ds::RED,
                                             };
                                             ui.add_space(Ds::SPACE_SM);
-                                            ui.label(RichText::new(format!("{}ms", ms)).size(Ds::FONT_SM).color(color).family(egui::FontFamily::Monospace));
+                                            ui.label(
+                                                RichText::new(format!("{}ms", ms))
+                                                    .size(Ds::FONT_SM)
+                                                    .color(color)
+                                                    .family(egui::FontFamily::Monospace),
+                                            );
                                             ui.add_space(4.0);
-                                            ui.label(RichText::new("•").size(Ds::FONT_SM).color(Ds::TEXT_MUTED));
+                                            ui.label(
+                                                RichText::new("•")
+                                                    .size(Ds::FONT_SM)
+                                                    .color(Ds::TEXT_MUTED),
+                                            );
                                         }
                                         Some(None) => {
                                             ui.add_space(Ds::SPACE_SM);
-                                            ui.label(RichText::new("timeout").size(Ds::FONT_SM).color(Ds::RED).family(egui::FontFamily::Monospace));
+                                            ui.label(
+                                                RichText::new("timeout")
+                                                    .size(Ds::FONT_SM)
+                                                    .color(Ds::RED)
+                                                    .family(egui::FontFamily::Monospace),
+                                            );
                                             ui.add_space(4.0);
-                                            ui.label(RichText::new("•").size(Ds::FONT_SM).color(Ds::TEXT_MUTED));
+                                            ui.label(
+                                                RichText::new("•")
+                                                    .size(Ds::FONT_SM)
+                                                    .color(Ds::TEXT_MUTED),
+                                            );
                                         }
                                         None => {} // ainda aguardando primeira medição
                                     }
 
                                     // IP/hostname
                                     ui.add_space(4.0);
-                                    ui.label(RichText::new(&ip).size(Ds::FONT_SM).color(Ds::TEXT_MUTED).family(egui::FontFamily::Monospace));
+                                    ui.label(
+                                        RichText::new(&ip)
+                                            .size(Ds::FONT_SM)
+                                            .color(Ds::TEXT_MUTED)
+                                            .family(egui::FontFamily::Monospace),
+                                    );
                                     ui.add_space(Ds::SPACE_SM);
-                                    ui.label(RichText::new("•").size(Ds::FONT_SM).color(Ds::TEXT_MUTED));
+                                    ui.label(
+                                        RichText::new("•").size(Ds::FONT_SM).color(Ds::TEXT_MUTED),
+                                    );
                                 }
 
                                 // Tempo online
-                                if let Some(connected_at) = self.session_connected_at.get(&active_pane) {
+                                if let Some(connected_at) =
+                                    self.session_connected_at.get(&active_pane)
+                                {
                                     let uptime = format_duration(connected_at.elapsed());
                                     ui.add_space(Ds::SPACE_SM);
-                                    ui.label(RichText::new(format!("⏱ {}", uptime)).size(Ds::FONT_SM).color(Ds::TEXT_MUTED));
+                                    ui.label(
+                                        RichText::new(format!("⏱ {}", uptime))
+                                            .size(Ds::FONT_SM)
+                                            .color(Ds::TEXT_MUTED),
+                                    );
                                 }
                             }
                         }
+                        // Versão do app — clicável, abre GitHub
+                        ui.add_space(Ds::SPACE_SM);
+                        ui.label(RichText::new("•").size(Ds::FONT_SM).color(Ds::TEXT_MUTED));
+                        ui.add_space(Ds::SPACE_SM);
+                        let ver = concat!("v", env!("CARGO_PKG_VERSION"));
+                        let ver_resp = ui.add(
+                            egui::Label::new(
+                                RichText::new(ver)
+                                    .size(Ds::FONT_SM)
+                                    .color(Ds::TEXT_MUTED)
+                                    .family(egui::FontFamily::Monospace),
+                            )
+                            .sense(egui::Sense::click()),
+                        );
+                        if ver_resp.clicked() {
+                            let _ = open::that("https://github.com/vagkaefer/nsr-ssh/releases");
+                        }
+                        ver_resp.on_hover_text("Ver releases no GitHub");
                         ui.add_space(Ds::SPACE_SM);
                     });
                 });
@@ -1235,189 +1725,302 @@ impl eframe::App for NsrApp {
         egui::CentralPanel::default()
             .frame(egui::Frame::new())
             .show(&ctx, |ui| {
-            let bg = ui.available_rect_before_wrap();
-            // Captura o rect ANTES de renderizar qualquer coisa (sem margens do Frame padrão)
-            let central_rect = bg;
-            ui.painter().rect_filled(bg, CornerRadius::ZERO, Ds::BG_BASE);
+                let bg = ui.available_rect_before_wrap();
+                // Captura o rect ANTES de renderizar qualquer coisa (sem margens do Frame padrão)
+                let central_rect = bg;
+                ui.painter()
+                    .rect_filled(bg, CornerRadius::ZERO, Ds::BG_BASE);
 
-            // Configurações ocupa a tela inteira quando aberta
-            if self.settings.open {
-                self.settings.show_as_page(ui, &mut self.theme);
-                return;
-            }
+                // Configurações ocupa a tela inteira quando aberta
+                if self.settings.open {
+                    self.settings.show_as_page(ui, &mut self.theme);
+                    // show_as_page pode ter setado open = false (Esc / botão fechar)
+                    if !self.settings.open {
+                        self.show_vault = self.vault_visible_before_settings;
+                    }
+                    return;
+                }
 
-            if self.tabs.is_empty() {
-                self.show_welcome(ui);
-            } else if let Some(active_id) = self.active_tab {
-                if let Some(tab_idx) = self.tabs.iter().position(|t| t.id == active_id) {
-                    let active_pane = self.tabs[tab_idx].active_pane;
-                    let font_size = self.settings.font_size;
+                if self.tabs.is_empty() {
+                    self.show_welcome(ui);
+                } else if let Some(active_id) = self.active_tab {
+                    if let Some(tab_idx) = self.tabs.iter().position(|t| t.id == active_id) {
+                        let active_pane = self.tabs[tab_idx].active_pane;
+                        let font_size = self.settings.font_size;
 
-                    let result = Self::render_pane_tree(
-                        ui, &mut self.tabs[tab_idx].pane_tree, active_pane,
-                        &mut self.terminal_buffers, &self.pane_states, font_size,
-                        &self.session_manager, &self.rt,
-                    );
-                    if let Some(na) = result.new_active {
-                        self.tabs[tab_idx].active_pane = na;
-                    }
-                    if let Some(text) = result.copy_text {
-                        ui.ctx().copy_text(text);
-                        self.status_message = "Copiado para área de transferência".into();
-                        self.status_ok = true;
-                    }
-                    if let Some(sid) = result.paste_requested {
-                        self.paste_from_clipboard(sid);
-                    }
-                    if let Some(sid) = result.save_content {
-                        self.save_terminal_content(sid);
-                    }
-                    if let Some(sid) = result.toggle_recording {
-                        self.toggle_terminal_recording(sid);
-                    }
-                    if let Some(sid) = result.reconnect {
-                        self.reconnect_session(sid, tab_idx);
-                    }
-                    if let Some(_sid) = result.close_pane {
-                        self.close_active_pane();
-                    }
-                    if result.split_h.is_some() {
-                        self.split_active_h();
-                    }
-                    if result.split_v.is_some() {
-                        self.split_active_v();
-                    }
+                        let result = Self::render_pane_tree(
+                            ui,
+                            &mut self.tabs[tab_idx].pane_tree,
+                            active_pane,
+                            &mut self.terminal_buffers,
+                            &self.pane_states,
+                            font_size,
+                            &self.session_manager,
+                            &self.rt,
+                        );
+                        if let Some(na) = result.new_active {
+                            self.tabs[tab_idx].active_pane = na;
+                        }
+                        if let Some(text) = result.copy_text {
+                            ui.ctx().copy_text(text);
+                            self.status_message = "Copiado para área de transferência".into();
+                            self.status_ok = true;
+                        }
+                        if let Some(sid) = result.paste_requested {
+                            self.paste_from_clipboard(sid);
+                        }
+                        if let Some(sid) = result.save_content {
+                            self.save_terminal_content(sid);
+                        }
+                        if let Some(sid) = result.toggle_recording {
+                            self.toggle_terminal_recording(sid);
+                        }
+                        if let Some(sid) = result.reconnect {
+                            self.reconnect_session(sid, tab_idx);
+                        }
+                        if let Some(_sid) = result.close_pane {
+                            self.close_active_pane();
+                        }
+                        if result.split_h.is_some() {
+                            self.split_active_h();
+                        }
+                        if result.split_v.is_some() {
+                            self.split_active_v();
+                        }
 
-                    // ── Zonas de drop quando há aba sendo arrastada ──────────
-                    if let Some(drag_id) = self.dragging_tab {
-                        // Mostra zonas mesmo arrastando a aba ativa, mas só se há mais de 1 tab OU
-                        // o tab ativo tem split (para mover pane para nova posição na mesma tab)
-                        let has_multiple_tabs = self.tabs.len() > 1;
-                        let is_different_tab = drag_id != active_id;
-                        if is_different_tab || has_multiple_tabs {
-                            let r = central_rect;
-                            let pointer_pos = ctx.input(|i| i.pointer.hover_pos());
-                            let mouse_released = ctx.input(|i| i.pointer.any_released());
-                            let painter = ctx.layer_painter(egui::LayerId::new(
-                                egui::Order::Foreground,
-                                egui::Id::new("drop_zones"),
-                            ));
+                        // ── Zonas de drop quando há aba sendo arrastada ──────────
+                        if let Some(drag_id) = self.dragging_tab {
+                            // Mostra zonas mesmo arrastando a aba ativa, mas só se há mais de 1 tab OU
+                            // o tab ativo tem split (para mover pane para nova posição na mesma tab)
+                            let has_multiple_tabs = self.tabs.len() > 1;
+                            let is_different_tab = drag_id != active_id;
+                            if is_different_tab || has_multiple_tabs {
+                                let r = central_rect;
+                                let pointer_pos = ctx.input(|i| i.pointer.hover_pos());
+                                let mouse_released = ctx.input(|i| i.pointer.any_released());
+                                let painter = ctx.layer_painter(egui::LayerId::new(
+                                    egui::Order::Foreground,
+                                    egui::Id::new("drop_zones"),
+                                ));
 
-                            // Determina zona pelo quadrante sem sobreposição:
-                            // divide o rect em 4 triângulos pelas diagonais
-                            let hovered_side = pointer_pos.and_then(|p| {
-                                if !r.contains(p) { return None; }
-                                let dx = p.x - r.center().x;  // + = direita
-                                let dy = p.y - r.center().y;  // + = baixo
-                                // Escala para comparação normalizada
-                                let nx = dx / (r.width() * 0.5);
-                                let ny = dy / (r.height() * 0.5);
-                                if nx.abs() > ny.abs() {
-                                    if nx > 0.0 { Some("right") } else { Some("left") }
-                                } else {
-                                    if ny > 0.0 { Some("bottom") } else { Some("top") }
-                                }
-                            });
+                                // Determina zona pelo quadrante sem sobreposição:
+                                // divide o rect em 4 triângulos pelas diagonais
+                                let hovered_side = pointer_pos.and_then(|p| {
+                                    if !r.contains(p) {
+                                        return None;
+                                    }
+                                    let dx = p.x - r.center().x; // + = direita
+                                    let dy = p.y - r.center().y; // + = baixo
+                                                                 // Escala para comparação normalizada
+                                    let nx = dx / (r.width() * 0.5);
+                                    let ny = dy / (r.height() * 0.5);
+                                    if nx.abs() > ny.abs() {
+                                        if nx > 0.0 {
+                                            Some("right")
+                                        } else {
+                                            Some("left")
+                                        }
+                                    } else {
+                                        if ny > 0.0 {
+                                            Some("bottom")
+                                        } else {
+                                            Some("top")
+                                        }
+                                    }
+                                });
 
-                            let zone_depth = 0.35; // 35% do lado como preview
-                            let zones: &[(&str, Rect, &str)] = &[
-                                ("↑  Cima",    Rect::from_min_max(r.min, Pos2::new(r.max.x, r.min.y + r.height() * zone_depth)), "top"),
-                                ("↓  Baixo",   Rect::from_min_max(Pos2::new(r.min.x, r.max.y - r.height() * zone_depth), r.max), "bottom"),
-                                ("←  Esquerda",Rect::from_min_max(r.min, Pos2::new(r.min.x + r.width() * zone_depth, r.max.y)), "left"),
-                                ("→  Direita", Rect::from_min_max(Pos2::new(r.max.x - r.width() * zone_depth, r.min.y), r.max), "right"),
-                            ];
+                                let zone_depth = 0.35; // 35% do lado como preview
+                                let zones: &[(&str, Rect, &str)] = &[
+                                    (
+                                        "↑  Cima",
+                                        Rect::from_min_max(
+                                            r.min,
+                                            Pos2::new(r.max.x, r.min.y + r.height() * zone_depth),
+                                        ),
+                                        "top",
+                                    ),
+                                    (
+                                        "↓  Baixo",
+                                        Rect::from_min_max(
+                                            Pos2::new(r.min.x, r.max.y - r.height() * zone_depth),
+                                            r.max,
+                                        ),
+                                        "bottom",
+                                    ),
+                                    (
+                                        "←  Esquerda",
+                                        Rect::from_min_max(
+                                            r.min,
+                                            Pos2::new(r.min.x + r.width() * zone_depth, r.max.y),
+                                        ),
+                                        "left",
+                                    ),
+                                    (
+                                        "→  Direita",
+                                        Rect::from_min_max(
+                                            Pos2::new(r.max.x - r.width() * zone_depth, r.min.y),
+                                            r.max,
+                                        ),
+                                        "right",
+                                    ),
+                                ];
 
-                            for (label, zone_rect, side) in zones {
-                                let active = hovered_side == Some(side);
-                                let fill = if active {
-                                    egui::Color32::from_rgba_premultiplied(
-                                        Ds::ACCENT.r(), Ds::ACCENT.g(), Ds::ACCENT.b(), 110,
-                                    )
-                                } else {
-                                    egui::Color32::from_rgba_premultiplied(80, 80, 120, 40)
-                                };
-                                painter.rect_filled(*zone_rect, egui::epaint::CornerRadius::ZERO, fill);
-                                if active {
-                                    painter.rect_stroke(
+                                for (label, zone_rect, side) in zones {
+                                    let active = hovered_side == Some(side);
+                                    let fill = if active {
+                                        egui::Color32::from_rgba_premultiplied(
+                                            Ds::ACCENT.r(),
+                                            Ds::ACCENT.g(),
+                                            Ds::ACCENT.b(),
+                                            110,
+                                        )
+                                    } else {
+                                        egui::Color32::from_rgba_premultiplied(80, 80, 120, 40)
+                                    };
+                                    painter.rect_filled(
                                         *zone_rect,
                                         egui::epaint::CornerRadius::ZERO,
-                                        egui::Stroke::new(2.0, Ds::ACCENT),
-                                        egui::StrokeKind::Inside,
+                                        fill,
                                     );
-                                }
-                                painter.text(
-                                    zone_rect.center(),
-                                    egui::Align2::CENTER_CENTER,
-                                    label,
-                                    egui::FontId::proportional(if active { 16.0 } else { 13.0 }),
-                                    if active { egui::Color32::WHITE } else { egui::Color32::from_white_alpha(100) },
-                                );
+                                    if active {
+                                        painter.rect_stroke(
+                                            *zone_rect,
+                                            egui::epaint::CornerRadius::ZERO,
+                                            egui::Stroke::new(2.0, Ds::ACCENT),
+                                            egui::StrokeKind::Inside,
+                                        );
+                                    }
+                                    painter.text(
+                                        zone_rect.center(),
+                                        egui::Align2::CENTER_CENTER,
+                                        label,
+                                        egui::FontId::proportional(if active {
+                                            16.0
+                                        } else {
+                                            13.0
+                                        }),
+                                        if active {
+                                            egui::Color32::WHITE
+                                        } else {
+                                            egui::Color32::from_white_alpha(100)
+                                        },
+                                    );
 
-                                if active && mouse_released {
-                                    // Não pode arrastar aba para si mesma sem split
-                                    if drag_id != active_id {
-                                        if let Some(drag_tab_idx) = self.tabs.iter().position(|t| t.id == drag_id) {
-                                            // Captura tudo por valor antes de qualquer mutação
-                                            let drag_session = self.tabs[drag_tab_idx].active_pane;
-                                            let dest_id = active_id; // ID estável, não índice
+                                    if active && mouse_released {
+                                        // Não pode arrastar aba para si mesma sem split
+                                        if drag_id != active_id {
+                                            if let Some(drag_tab_idx) =
+                                                self.tabs.iter().position(|t| t.id == drag_id)
+                                            {
+                                                // Captura tudo por valor antes de qualquer mutação
+                                                let drag_session =
+                                                    self.tabs[drag_tab_idx].active_pane;
+                                                let dest_id = active_id; // ID estável, não índice
 
-                                            // Remove aba arrastada primeiro
-                                            self.tabs.remove(drag_tab_idx);
+                                                // Remove aba arrastada primeiro
+                                                self.tabs.remove(drag_tab_idx);
 
-                                            // Reindexar pelo ID, que é estável
-                                            if let Some(dest_idx) = self.tabs.iter().position(|t| t.id == dest_id) {
-                                                let dest_session = self.tabs[dest_idx].active_pane;
-                                                let old_tree = std::mem::replace(
-                                                    &mut self.tabs[dest_idx].pane_tree,
-                                                    PaneTree::Terminal(dest_session),
-                                                );
-                                                self.tabs[dest_idx].pane_tree = match *side {
-                                                    "left"   => PaneTree::HSplit { ratio: 0.5, left:  Box::new(PaneTree::Terminal(drag_session)), right: Box::new(old_tree) },
-                                                    "right"  => PaneTree::HSplit { ratio: 0.5, left:  Box::new(old_tree), right: Box::new(PaneTree::Terminal(drag_session)) },
-                                                    "top"    => PaneTree::VSplit { ratio: 0.5, top:   Box::new(PaneTree::Terminal(drag_session)), bottom: Box::new(old_tree) },
-                                                    _        => PaneTree::VSplit { ratio: 0.5, top:   Box::new(old_tree), bottom: Box::new(PaneTree::Terminal(drag_session)) },
-                                                };
-                                                self.tabs[dest_idx].active_pane = drag_session;
-                                                self.active_tab = Some(dest_id);
+                                                // Reindexar pelo ID, que é estável
+                                                if let Some(dest_idx) =
+                                                    self.tabs.iter().position(|t| t.id == dest_id)
+                                                {
+                                                    let dest_session =
+                                                        self.tabs[dest_idx].active_pane;
+                                                    let old_tree = std::mem::replace(
+                                                        &mut self.tabs[dest_idx].pane_tree,
+                                                        PaneTree::Terminal(dest_session),
+                                                    );
+                                                    self.tabs[dest_idx].pane_tree = match *side {
+                                                        "left" => PaneTree::HSplit {
+                                                            ratio: 0.5,
+                                                            left: Box::new(PaneTree::Terminal(
+                                                                drag_session,
+                                                            )),
+                                                            right: Box::new(old_tree),
+                                                        },
+                                                        "right" => PaneTree::HSplit {
+                                                            ratio: 0.5,
+                                                            left: Box::new(old_tree),
+                                                            right: Box::new(PaneTree::Terminal(
+                                                                drag_session,
+                                                            )),
+                                                        },
+                                                        "top" => PaneTree::VSplit {
+                                                            ratio: 0.5,
+                                                            top: Box::new(PaneTree::Terminal(
+                                                                drag_session,
+                                                            )),
+                                                            bottom: Box::new(old_tree),
+                                                        },
+                                                        _ => PaneTree::VSplit {
+                                                            ratio: 0.5,
+                                                            top: Box::new(old_tree),
+                                                            bottom: Box::new(PaneTree::Terminal(
+                                                                drag_session,
+                                                            )),
+                                                        },
+                                                    };
+                                                    self.tabs[dest_idx].active_pane = drag_session;
+                                                    self.active_tab = Some(dest_id);
 
-                                                // Envia resize imediato para as duas sessões com ~metade das colunas/linhas
-                                                // para que o shell redesenhe antes do próximo frame (minimiza "flash" preto)
-                                                let font_size = self.settings.font_size;
-                                                let char_w = font_size * 0.601;
-                                                let char_h = font_size * 1.25;
-                                                let half_cols = ((central_rect.width() * 0.5 / char_w) as u16).max(10);
-                                                let half_rows = ((central_rect.height() / char_h) as u16).max(4);
-                                                let sm = self.session_manager.clone();
-                                                let rt = self.rt.clone();
-                                                let ds = drag_session;
-                                                let dest_s = dest_session;
-                                                rt.block_on(async {
-                                                    sm.resize(ds, half_cols, half_rows).await;
-                                                    sm.resize(dest_s, half_cols, half_rows).await;
-                                                });
-                                                // Atualiza buffers locais para não disparar resize duplo no próximo frame
-                                                if let Some(buf) = self.terminal_buffers.get(&ds) {
-                                                    if let Ok(mut b) = buf.lock() { b.resize(half_cols as usize, half_rows as usize); }
-                                                }
-                                                if let Some(buf) = self.terminal_buffers.get(&dest_s) {
-                                                    if let Ok(mut b) = buf.lock() { b.resize(half_cols as usize, half_rows as usize); }
+                                                    // Envia resize imediato para as duas sessões com ~metade das colunas/linhas
+                                                    // para que o shell redesenhe antes do próximo frame (minimiza "flash" preto)
+                                                    let font_size = self.settings.font_size;
+                                                    let char_w = font_size * 0.601;
+                                                    let char_h = font_size * 1.25;
+                                                    let half_cols = ((central_rect.width() * 0.5
+                                                        / char_w)
+                                                        as u16)
+                                                        .max(10);
+                                                    let half_rows =
+                                                        ((central_rect.height() / char_h) as u16)
+                                                            .max(4);
+                                                    let sm = self.session_manager.clone();
+                                                    let rt = self.rt.clone();
+                                                    let ds = drag_session;
+                                                    let dest_s = dest_session;
+                                                    rt.block_on(async {
+                                                        sm.resize(ds, half_cols, half_rows).await;
+                                                        sm.resize(dest_s, half_cols, half_rows)
+                                                            .await;
+                                                    });
+                                                    // Atualiza buffers locais para não disparar resize duplo no próximo frame
+                                                    if let Some(buf) =
+                                                        self.terminal_buffers.get(&ds)
+                                                    {
+                                                        if let Ok(mut b) = buf.lock() {
+                                                            b.resize(
+                                                                half_cols as usize,
+                                                                half_rows as usize,
+                                                            );
+                                                        }
+                                                    }
+                                                    if let Some(buf) =
+                                                        self.terminal_buffers.get(&dest_s)
+                                                    {
+                                                        if let Ok(mut b) = buf.lock() {
+                                                            b.resize(
+                                                                half_cols as usize,
+                                                                half_rows as usize,
+                                                            );
+                                                        }
+                                                    }
                                                 }
                                             }
                                         }
+                                        self.dragging_tab = None;
                                     }
+                                }
+
+                                // Cancela drag se soltar fora de qualquer zona
+                                if mouse_released && hovered_side.is_none() {
                                     self.dragging_tab = None;
                                 }
-                            }
-
-                            // Cancela drag se soltar fora de qualquer zona
-                            if mouse_released && hovered_side.is_none() {
-                                self.dragging_tab = None;
                             }
                         }
                     }
                 }
-            }
-        });
+            });
 
         // Fallback: limpa drag se mouse foi solto fora de qualquer zona de drop
         if self.dragging_tab.is_some() {
@@ -1449,28 +2052,61 @@ fn replace_session_id(tree: crate::pane::PaneTree, old: Uuid, new: Uuid) -> crat
 }
 
 fn merge_pane_result(dst: &mut PaneResult, src: PaneResult) {
-    if src.new_active.is_some() { dst.new_active = src.new_active; }
-    if src.copy_text.is_some() { dst.copy_text = src.copy_text; }
-    if src.paste_requested.is_some() { dst.paste_requested = src.paste_requested; }
-    if src.save_content.is_some() { dst.save_content = src.save_content; }
-    if src.toggle_recording.is_some() { dst.toggle_recording = src.toggle_recording; }
-    if src.reconnect.is_some() { dst.reconnect = src.reconnect; }
-    if src.close_pane.is_some() { dst.close_pane = src.close_pane; }
-    if src.split_h.is_some() { dst.split_h = src.split_h; }
-    if src.split_v.is_some() { dst.split_v = src.split_v; }
+    if src.new_active.is_some() {
+        dst.new_active = src.new_active;
+    }
+    if src.copy_text.is_some() {
+        dst.copy_text = src.copy_text;
+    }
+    if src.paste_requested.is_some() {
+        dst.paste_requested = src.paste_requested;
+    }
+    if src.save_content.is_some() {
+        dst.save_content = src.save_content;
+    }
+    if src.toggle_recording.is_some() {
+        dst.toggle_recording = src.toggle_recording;
+    }
+    if src.reconnect.is_some() {
+        dst.reconnect = src.reconnect;
+    }
+    if src.close_pane.is_some() {
+        dst.close_pane = src.close_pane;
+    }
+    if src.split_h.is_some() {
+        dst.split_h = src.split_h;
+    }
+    if src.split_v.is_some() {
+        dst.split_v = src.split_v;
+    }
 }
 
-fn quick_action_card(ui: &mut egui::Ui, icon: &str, label: &str, shortcut: &str, width: f32) -> egui::Response {
+fn quick_action_card(
+    ui: &mut egui::Ui,
+    icon: &str,
+    label: &str,
+    shortcut: &str,
+    width: f32,
+) -> egui::Response {
     let card_h = 76.0;
     let sense = egui::Sense::click();
     let (rect, resp) = ui.allocate_exact_size(Vec2::new(width, card_h), sense);
 
     if ui.is_rect_visible(rect) {
         let hovered = resp.hovered();
-        let fill = if hovered { Ds::BG_ACTIVE } else { Ds::BG_SURFACE };
+        let fill = if hovered {
+            Ds::BG_ACTIVE
+        } else {
+            Ds::BG_SURFACE
+        };
         let border = if hovered { Ds::ACCENT } else { Ds::BORDER };
         ui.painter().rect_filled(rect, Ds::R_MD, fill);
-        ui.painter().rect_stroke(rect, Ds::R_MD, Stroke::new(1.0, border), egui::StrokeKind::Inside);
+        ui.painter().rect_stroke(
+            rect,
+            Ds::R_MD,
+            Stroke::new(1.0, border),
+            egui::StrokeKind::Inside,
+        );
 
         // ícone
         ui.painter().text(
@@ -1478,7 +2114,11 @@ fn quick_action_card(ui: &mut egui::Ui, icon: &str, label: &str, shortcut: &str,
             egui::Align2::CENTER_TOP,
             icon,
             egui::FontId::proportional(18.0),
-            if hovered { Ds::ACCENT } else { Ds::TEXT_SECONDARY },
+            if hovered {
+                Ds::ACCENT
+            } else {
+                Ds::TEXT_SECONDARY
+            },
         );
         // label
         ui.painter().text(
@@ -1505,16 +2145,33 @@ fn key_to_bytes(key: Key, modifiers: Modifiers) -> Vec<u8> {
     // Ctrl+letra → ASCII control code (Ctrl+A = 0x01 ... Ctrl+Z = 0x1A)
     if modifiers.ctrl && !modifiers.shift && !modifiers.alt {
         let ctrl_byte: Option<u8> = match key {
-            Key::A => Some(0x01), Key::B => Some(0x02), Key::C => Some(0x03),
-            Key::D => Some(0x04), Key::E => Some(0x05), Key::F => Some(0x06),
-            Key::G => Some(0x07), Key::H => Some(0x08), Key::I => Some(0x09),
-            Key::J => Some(0x0A), Key::K => Some(0x0B), Key::L => Some(0x0C),
-            Key::M => Some(0x0D), Key::N => Some(0x0E), Key::O => Some(0x0F),
-            Key::P => Some(0x10), Key::Q => Some(0x11), Key::R => Some(0x12),
-            Key::S => Some(0x13), Key::T => Some(0x14), Key::U => Some(0x15),
-            Key::V => Some(0x16), Key::W => Some(0x17), Key::X => Some(0x18),
-            Key::Y => Some(0x19), Key::Z => Some(0x1A),
-            Key::OpenBracket => Some(0x1B),  // Ctrl+[ = ESC
+            Key::A => Some(0x01),
+            Key::B => Some(0x02),
+            Key::C => Some(0x03),
+            Key::D => Some(0x04),
+            Key::E => Some(0x05),
+            Key::F => Some(0x06),
+            Key::G => Some(0x07),
+            Key::H => Some(0x08),
+            Key::I => Some(0x09),
+            Key::J => Some(0x0A),
+            Key::K => Some(0x0B),
+            Key::L => Some(0x0C),
+            Key::M => Some(0x0D),
+            Key::N => Some(0x0E),
+            Key::O => Some(0x0F),
+            Key::P => Some(0x10),
+            Key::Q => Some(0x11),
+            Key::R => Some(0x12),
+            Key::S => Some(0x13),
+            Key::T => Some(0x14),
+            Key::U => Some(0x15),
+            Key::V => Some(0x16),
+            Key::W => Some(0x17),
+            Key::X => Some(0x18),
+            Key::Y => Some(0x19),
+            Key::Z => Some(0x1A),
+            Key::OpenBracket => Some(0x1B), // Ctrl+[ = ESC
             Key::Backslash => Some(0x1C),
             Key::CloseBracket => Some(0x1D),
             _ => None,
@@ -1530,20 +2187,32 @@ fn key_to_bytes(key: Key, modifiers: Modifiers) -> Vec<u8> {
         Key::Tab => vec![b'\t'],
         Key::Escape => vec![0x1b],
         Key::ArrowUp => {
-            if modifiers.shift { vec![0x1b, b'[', b'1', b';', b'2', b'A'] }
-            else { vec![0x1b, b'[', b'A'] }
+            if modifiers.shift {
+                vec![0x1b, b'[', b'1', b';', b'2', b'A']
+            } else {
+                vec![0x1b, b'[', b'A']
+            }
         }
         Key::ArrowDown => {
-            if modifiers.shift { vec![0x1b, b'[', b'1', b';', b'2', b'B'] }
-            else { vec![0x1b, b'[', b'B'] }
+            if modifiers.shift {
+                vec![0x1b, b'[', b'1', b';', b'2', b'B']
+            } else {
+                vec![0x1b, b'[', b'B']
+            }
         }
         Key::ArrowRight => {
-            if modifiers.ctrl { vec![0x1b, b'[', b'1', b';', b'5', b'C'] }
-            else { vec![0x1b, b'[', b'C'] }
+            if modifiers.ctrl {
+                vec![0x1b, b'[', b'1', b';', b'5', b'C']
+            } else {
+                vec![0x1b, b'[', b'C']
+            }
         }
         Key::ArrowLeft => {
-            if modifiers.ctrl { vec![0x1b, b'[', b'1', b';', b'5', b'D'] }
-            else { vec![0x1b, b'[', b'D'] }
+            if modifiers.ctrl {
+                vec![0x1b, b'[', b'1', b';', b'5', b'D']
+            } else {
+                vec![0x1b, b'[', b'D']
+            }
         }
         Key::Home => vec![0x1b, b'[', b'H'],
         Key::End => vec![0x1b, b'[', b'F'],
