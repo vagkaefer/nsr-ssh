@@ -1047,6 +1047,13 @@ impl eframe::App for NsrApp {
                         TabBarAction::StartDrag(id) => self.dragging_tab = Some(id),
                         TabBarAction::EndDrag => { /* handled by CentralPanel drop logic */ }
                         TabBarAction::DetachPane(_) => self.detach_active_pane(),
+                        TabBarAction::CloseWindow => ctx.send_viewport_cmd(egui::ViewportCommand::Close),
+                        TabBarAction::Minimize => ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(true)),
+                        TabBarAction::MaximizeToggle => {
+                            let is_max = ctx.input(|i| i.viewport().maximized.unwrap_or(false));
+                            ctx.send_viewport_cmd(egui::ViewportCommand::Maximized(!is_max));
+                        }
+                        TabBarAction::DragWindow => ctx.send_viewport_cmd(egui::ViewportCommand::StartDrag),
                     }
                 }
             });

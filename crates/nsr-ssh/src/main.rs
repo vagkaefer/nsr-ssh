@@ -15,7 +15,8 @@ fn main() -> eframe::Result<()> {
 
     let mut viewport = ViewportBuilder::default()
         .with_title("NSR-SSH")
-        .with_app_id("nsr-ssh")   // deve bater com o nome do .desktop no Wayland
+        .with_app_id("nsr-ssh")
+        .with_decorations(false)
         .with_inner_size([1280.0, 800.0])
         .with_min_inner_size([800.0, 500.0]);
 

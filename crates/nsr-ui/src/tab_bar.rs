@@ -17,10 +17,8 @@ impl TabBar {
         let mut action = None;
         let h = Ds::TAB_H;
 
-        // Fundo da barra de abas
         let bar_rect = ui.available_rect_before_wrap();
         ui.painter().rect_filled(bar_rect, CornerRadius::ZERO, Ds::BG_PANEL);
-        // linha separadora na base
         ui.painter().line_segment(
             [bar_rect.left_bottom(), bar_rect.right_bottom()],
             Stroke::new(1.0, Ds::BORDER),
@@ -53,7 +51,6 @@ impl TabBar {
                 let is_active = active_tab == Some(tab.id);
                 let tab_id = tab.id;
                 let title = tab.title.clone();
-
                 if let Some(a) = draw_tab(ui, &title, is_active, tab_id) {
                     action = Some(a);
                 }
@@ -62,29 +59,34 @@ impl TabBar {
             // Botão nova aba (+)
             let btn = ui.add_sized(
                 Vec2::new(h, h),
-                egui::Button::new(
-                    RichText::new("+")
-                        .color(Ds::TEXT_SECONDARY)
-                        .size(18.0),
-                )
-                .fill(Color32::TRANSPARENT)
-                .stroke(Stroke::NONE),
+                egui::Button::new(RichText::new("+").color(Ds::TEXT_SECONDARY).size(18.0))
+                    .fill(Color32::TRANSPARENT)
+                    .stroke(Stroke::NONE),
             );
-            if btn.clicked() {
-                action = Some(TabBarAction::New);
-            }
+            if btn.clicked() { action = Some(TabBarAction::New); }
             if btn.hovered() {
-                ui.painter().rect_filled(
-                    btn.rect.shrink(4.0),
-                    Ds::R_SM,
-                    Ds::BG_HOVER,
-                );
+                ui.painter().rect_filled(btn.rect.shrink(4.0), Ds::R_SM, Ds::BG_HOVER);
             }
 
-            // Botões à direita
+            // Botões à direita: controles de janela + ferramentas
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                ui.add_space(Ds::SPACE_SM);
+                // ── Controles de janela (sem decoração do SO) ──────────────
+                win_close_btn(ui, &mut action);
+                win_max_btn(ui, &mut action);
+                win_min_btn(ui, &mut action);
 
+                // Separador
+                ui.add_space(4.0);
+                ui.painter().line_segment(
+                    [
+                        Pos2::new(ui.cursor().right(), bar_rect.top() + 8.0),
+                        Pos2::new(ui.cursor().right(), bar_rect.bottom() - 8.0),
+                    ],
+                    Stroke::new(1.0, Ds::BORDER),
+                );
+                ui.add_space(4.0);
+
+                // Ferramentas
                 let gear = tab_icon_btn(ui, "⚙", "Configurações  (Ctrl+,)");
                 if gear.clicked() { action = Some(TabBarAction::OpenSettings); }
 
@@ -103,8 +105,72 @@ impl TabBar {
             });
         });
 
+        // Drag na área vazia = mover janela.
+        // Só dispara se não há widget do egui sendo arrastado (abas, etc.)
+        let no_widget_drag = ui.ctx().dragged_id().is_none();
+        let (primary_pressed, is_moving, press_origin, dbl_click_pos) = ui.input(|i| (
+            i.pointer.primary_pressed(),
+            i.pointer.is_moving(),
+            i.pointer.press_origin(),
+            if i.pointer.button_double_clicked(egui::PointerButton::Primary) { i.pointer.interact_pos() } else { None },
+        ));
+
+        // Inicia move ao pressionar+arrastar na barra (não em widget interativo)
+        if primary_pressed && is_moving && no_widget_drag {
+            if press_origin.map(|p| bar_rect.contains(p)).unwrap_or(false) {
+                action = Some(TabBarAction::DragWindow);
+            }
+        }
+
+        // Double-click na barra = maximizar toggle
+        if let Some(pos) = dbl_click_pos {
+            if bar_rect.contains(pos) {
+                action = Some(TabBarAction::MaximizeToggle);
+            }
+        }
+
         action
     }
+}
+
+fn win_close_btn(ui: &mut Ui, action: &mut Option<TabBarAction>) {
+    let size = Vec2::splat(32.0);
+    let (rect, resp) = ui.allocate_exact_size(size, egui::Sense::click());
+    let hovered = resp.hovered();
+    let fill = if hovered { Color32::from_rgb(220, 53, 69) } else { Color32::TRANSPARENT };
+    ui.painter().rect_filled(rect, Ds::R_SM, fill);
+    // Desenha X manualmente com duas linhas para garantir visibilidade
+    let c = rect.center();
+    let r = 5.0_f32;
+    let col = if hovered { Color32::WHITE } else { Ds::TEXT_MUTED };
+    ui.painter().line_segment([egui::pos2(c.x - r, c.y - r), egui::pos2(c.x + r, c.y + r)], Stroke::new(1.5, col));
+    ui.painter().line_segment([egui::pos2(c.x + r, c.y - r), egui::pos2(c.x - r, c.y + r)], Stroke::new(1.5, col));
+    if resp.clicked() { *action = Some(TabBarAction::CloseWindow); }
+    resp.on_hover_text("Fechar");
+}
+
+fn win_max_btn(ui: &mut Ui, action: &mut Option<TabBarAction>) {
+    let size = Vec2::splat(32.0);
+    let (rect, resp) = ui.allocate_exact_size(size, egui::Sense::click());
+    let hovered = resp.hovered();
+    ui.painter().rect_filled(rect, Ds::R_SM, if hovered { Ds::BG_HOVER } else { Color32::TRANSPARENT });
+    let inner = rect.shrink(10.0);
+    let col = if hovered { Ds::TEXT_PRIMARY } else { Ds::TEXT_MUTED };
+    ui.painter().rect_stroke(inner, egui::epaint::CornerRadius::same(1), Stroke::new(1.5, col), egui::StrokeKind::Inside);
+    if resp.clicked() { *action = Some(TabBarAction::MaximizeToggle); }
+    resp.on_hover_text("Maximizar / Restaurar");
+}
+
+fn win_min_btn(ui: &mut Ui, action: &mut Option<TabBarAction>) {
+    let size = Vec2::splat(32.0);
+    let (rect, resp) = ui.allocate_exact_size(size, egui::Sense::click());
+    let hovered = resp.hovered();
+    ui.painter().rect_filled(rect, Ds::R_SM, if hovered { Ds::BG_HOVER } else { Color32::TRANSPARENT });
+    let c = rect.center();
+    let col = if hovered { Ds::TEXT_PRIMARY } else { Ds::TEXT_MUTED };
+    ui.painter().line_segment([Pos2::new(c.x - 5.0, c.y + 3.0), Pos2::new(c.x + 5.0, c.y + 3.0)], Stroke::new(1.5, col));
+    if resp.clicked() { *action = Some(TabBarAction::Minimize); }
+    resp.on_hover_text("Minimizar");
 }
 
 fn tab_icon_btn(ui: &mut Ui, icon: &str, tooltip: &str) -> egui::Response {
@@ -256,4 +322,9 @@ pub enum TabBarAction {
     StartDrag(Uuid),
     EndDrag,
     DetachPane(Uuid),
+    // Controles de janela (sem decoração do SO)
+    CloseWindow,
+    Minimize,
+    MaximizeToggle,
+    DragWindow,
 }
