@@ -1117,10 +1117,6 @@ impl eframe::App for NsrApp {
                 self.connect_to_host_with_password(req.host, req.password);
             }
         }
-        if self.settings.open {
-            self.settings.show_window(&ctx, &mut self.theme);
-        }
-
         // ── Central panel ────────────────────────────────────────────────────
         egui::CentralPanel::default()
             .frame(egui::Frame::new())
@@ -1129,6 +1125,12 @@ impl eframe::App for NsrApp {
             // Captura o rect ANTES de renderizar qualquer coisa (sem margens do Frame padrão)
             let central_rect = bg;
             ui.painter().rect_filled(bg, CornerRadius::ZERO, Ds::BG_BASE);
+
+            // Configurações ocupa a tela inteira quando aberta
+            if self.settings.open {
+                self.settings.show_as_page(ui, &mut self.theme);
+                return;
+            }
 
             if self.tabs.is_empty() {
                 self.show_welcome(ui);
