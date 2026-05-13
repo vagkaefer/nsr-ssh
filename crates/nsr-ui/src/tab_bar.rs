@@ -24,6 +24,11 @@ impl TabBar {
             Stroke::new(1.0, Ds::BORDER),
         );
 
+        // Registra drag da janela ANTES dos botões — widgets alocados depois têm prioridade
+        // de input maior, então botões sobrepõem esta área automaticamente.
+        let drag_id = egui::Id::new("window_drag_area");
+        let drag_resp = ui.interact(bar_rect, drag_id, egui::Sense::click_and_drag());
+
         ui.horizontal(|ui| {
             ui.spacing_mut().item_spacing = Vec2::new(2.0, 0.0);
             ui.set_min_height(h);
@@ -105,28 +110,11 @@ impl TabBar {
             });
         });
 
-        // Drag na área vazia = mover janela.
-        // Só dispara se não há widget do egui sendo arrastado (abas, etc.)
-        let no_widget_drag = ui.ctx().dragged_id().is_none();
-        let (primary_pressed, is_moving, press_origin, dbl_click_pos) = ui.input(|i| (
-            i.pointer.primary_pressed(),
-            i.pointer.is_moving(),
-            i.pointer.press_origin(),
-            if i.pointer.button_double_clicked(egui::PointerButton::Primary) { i.pointer.interact_pos() } else { None },
-        ));
-
-        // Inicia move ao pressionar+arrastar na barra (não em widget interativo)
-        if primary_pressed && is_moving && no_widget_drag {
-            if press_origin.map(|p| bar_rect.contains(p)).unwrap_or(false) {
-                action = Some(TabBarAction::DragWindow);
-            }
+        if drag_resp.drag_started() {
+            action = Some(TabBarAction::DragWindow);
         }
-
-        // Double-click na barra = maximizar toggle
-        if let Some(pos) = dbl_click_pos {
-            if bar_rect.contains(pos) {
-                action = Some(TabBarAction::MaximizeToggle);
-            }
+        if drag_resp.double_clicked() {
+            action = Some(TabBarAction::MaximizeToggle);
         }
 
         action

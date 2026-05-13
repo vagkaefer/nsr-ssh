@@ -45,7 +45,7 @@ impl SettingsPanel {
 
         // Título e botão fechar na topbar
         let mut should_close = false;
-        ui.allocate_ui_at_rect(topbar_rect, |ui| {
+        ui.scope_builder(egui::UiBuilder::new().max_rect(topbar_rect), |ui| {
             ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
                 ui.add_space(Ds::SPACE_LG);
                 ui.label(
@@ -91,7 +91,7 @@ impl SettingsPanel {
             Stroke::new(1.0, Ds::BORDER),
         );
 
-        ui.allocate_ui_at_rect(sidebar_rect, |ui| {
+        ui.scope_builder(egui::UiBuilder::new().max_rect(sidebar_rect), |ui| {
             ui.add_space(Ds::SPACE_LG);
             ui.with_layout(egui::Layout::top_down(egui::Align::Min), |ui| {
                 ui.add_space(Ds::SPACE_SM);
@@ -103,7 +103,7 @@ impl SettingsPanel {
         });
 
         // Content
-        ui.allocate_ui_at_rect(content_rect, |ui| {
+        ui.scope_builder(egui::UiBuilder::new().max_rect(content_rect), |ui| {
             egui::ScrollArea::vertical()
                 .auto_shrink([false, false])
                 .show(ui, |ui| {

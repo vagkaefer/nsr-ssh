@@ -23,6 +23,7 @@ use crate::pane::{PaneTree, Tab};
 use crate::settings::SettingsPanel;
 use crate::tab_bar::{TabBar, TabBarAction};
 use crate::terminal_widget::{TerminalBuffer, TerminalWidgetResult};
+use crate::updater::{UpdateState, spawn_update_check};
 use crate::vault_panel::{VaultAction, VaultPanel};
 
 #[derive(Default)]
@@ -48,6 +49,9 @@ pub struct NsrApp {
     output_receivers: HashMap<Uuid, mpsc::Receiver<Vec<u8>>>,
     pane_states: HashMap<Uuid, PaneState>,
     session_connected_at: HashMap<Uuid, Instant>,
+    // session_id → latência TCP em ms (None = ainda não medido / falhou)
+    latency_ms: Arc<Mutex<HashMap<Uuid, Option<u32>>>>,
+    last_latency_check: Instant,
 
     session_manager: Arc<SessionManager>,
     event_rx: broadcast::Receiver<SessionEvent>,
@@ -64,6 +68,7 @@ pub struct NsrApp {
     dragging_tab: Option<Uuid>,      // tab_id sendo arrastado
     status_message: String,
     status_ok: bool,
+    update_state: UpdateState,
 }
 
 impl NsrApp {
@@ -100,6 +105,9 @@ impl NsrApp {
         let theme = themes.into_iter().next().unwrap_or_else(nsr_theme::builtin::dracula);
         let theme_name = theme.name.clone();
 
+        let rt_ref = Arc::clone(&rt);
+        let update_state = spawn_update_check(&rt_ref);
+
         Self {
             tabs: Vec::new(),
             active_tab: None,
@@ -109,6 +117,8 @@ impl NsrApp {
             output_receivers: HashMap::new(),
             pane_states: HashMap::new(),
             session_connected_at: HashMap::new(),
+            latency_ms: Arc::new(Mutex::new(HashMap::new())),
+            last_latency_check: Instant::now(),
             session_manager,
             event_rx,
             ssh_config_mtime: initial_mtime,
@@ -122,6 +132,7 @@ impl NsrApp {
             dragging_tab: None,
             status_message: "Pronto".into(),
             status_ok: true,
+            update_state,
         }
     }
 
@@ -310,6 +321,49 @@ impl NsrApp {
                 }
             }
             Err(_) => {}
+        }
+    }
+
+    fn update_latencies(&mut self) {
+        const INTERVAL: Duration = Duration::from_secs(5);
+        if self.last_latency_check.elapsed() < INTERVAL {
+            return;
+        }
+        self.last_latency_check = Instant::now();
+
+        // Coleta (session_id, hostname, port) das sessões conectadas
+        let targets: Vec<(Uuid, String, u16)> = self.tabs.iter()
+            .flat_map(|tab| tab.pane_tree.sessions())
+            .filter_map(|sid| {
+                if !matches!(self.pane_states.get(&sid), Some(PaneState::Connected)) {
+                    return None;
+                }
+                let alias = self.tabs.iter()
+                    .find(|t| t.pane_tree.sessions().contains(&sid))
+                    .map(|t| t.host_alias.clone())?;
+                let host = self.hosts.iter().find(|h| h.alias == alias)?;
+                Some((sid, host.hostname.clone(), host.port))
+            })
+            .collect();
+
+        // Dispara medição TCP em background para cada sessão (IPv4 e IPv6 transparentes)
+        for (sid, hostname, port) in targets {
+            let addr = format!("{}:{}", hostname, port);
+            let store = Arc::clone(&self.latency_ms);
+            self.rt.spawn(async move {
+                let start = tokio::time::Instant::now();
+                let result = tokio::time::timeout(
+                    Duration::from_secs(3),
+                    tokio::net::TcpStream::connect(addr.as_str()),
+                ).await;
+                let ms = match result {
+                    Ok(Ok(_)) => Some(start.elapsed().as_millis() as u32),
+                    _ => None,
+                };
+                if let Ok(mut map) = store.lock() {
+                    map.insert(sid, ms);
+                }
+            });
         }
     }
 
@@ -713,11 +767,7 @@ impl NsrApp {
 
         // Cria nova aba com esse pane
         let host_alias = self.hosts.iter()
-            .find(|h| {
-                if let Some(buf) = self.terminal_buffers.get(&active_pane) {
-                    let _ = buf; true
-                } else { false }
-            })
+            .find(|_h| self.terminal_buffers.contains_key(&active_pane))
             .map(|h| h.alias.clone())
             .unwrap_or_else(|| format!("pane-{}", &active_pane.to_string()[..4]));
 
@@ -992,6 +1042,7 @@ impl eframe::App for NsrApp {
         self.process_session_events();
         self.drain_output_receivers();
         self.check_ssh_config_changes();
+        self.update_latencies();
 
         Ds::apply_global_visuals(&ctx);
 
@@ -1053,7 +1104,12 @@ impl eframe::App for NsrApp {
                             let is_max = ctx.input(|i| i.viewport().maximized.unwrap_or(false));
                             ctx.send_viewport_cmd(egui::ViewportCommand::Maximized(!is_max));
                         }
-                        TabBarAction::DragWindow => ctx.send_viewport_cmd(egui::ViewportCommand::StartDrag),
+                        TabBarAction::DragWindow => {
+                            // Só move a janela se não há aba sendo arrastada
+                            if self.dragging_tab.is_none() {
+                                ctx.send_viewport_cmd(egui::ViewportCommand::StartDrag);
+                            }
+                        }
                     }
                 }
             });
@@ -1080,15 +1136,66 @@ impl eframe::App for NsrApp {
                     ui.label(RichText::new(&self.status_message).size(Ds::FONT_SM).color(Ds::TEXT_SECONDARY));
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                         ui.add_space(Ds::SPACE_SM);
+
+                        // Badge de update disponível
+                        if let Ok(guard) = self.update_state.lock() {
+                            if let Some(Some(ref info)) = *guard {
+                                let url = info.release_url.clone();
+                                let label = format!("Atualizar para {}", info.latest_version);
+                                let badge = egui::Button::new(
+                                    RichText::new(label).size(Ds::FONT_SM).color(Ds::BG_BASE).strong(),
+                                )
+                                .fill(Ds::ACCENT)
+                                .stroke(egui::Stroke::NONE)
+                                .corner_radius(Ds::R_SM);
+                                if ui.add(badge).on_hover_text("Abrir página de releases no GitHub").clicked() {
+                                    let _ = open::that(&url);
+                                }
+                                ui.add_space(Ds::SPACE_SM);
+                            }
+                        }
+
                         ui.label(RichText::new(format!("{} sessões  •  {} hosts", self.tabs.len(), self.hosts.len())).size(Ds::FONT_SM).color(Ds::TEXT_MUTED));
                         // Stats da sessão ativa
                         if let Some(active_id) = self.active_tab {
                             if let Some(tab) = self.tabs.iter().find(|t| t.id == active_id) {
                                 let active_pane = tab.active_pane;
-                                // ID abreviado da sessão
-                                let short_id = &active_pane.to_string()[..8];
-                                ui.add_space(Ds::SPACE_SM);
-                                ui.label(RichText::new(format!("ID:{}", short_id)).size(Ds::FONT_SM).color(Ds::TEXT_MUTED).family(egui::FontFamily::Monospace));
+
+                                // Latência + IP do servidor
+                                if let Some(host) = self.hosts.iter().find(|h| h.alias == tab.host_alias) {
+                                    let ip = host.hostname.clone();
+                                    let lat_entry = self.latency_ms.lock().ok()
+                                        .and_then(|m| m.get(&active_pane).copied());
+
+                                    // Latência
+                                    match lat_entry {
+                                        Some(Some(ms)) => {
+                                            let color = match ms {
+                                                0..=50   => Ds::GREEN,
+                                                51..=150 => Ds::YELLOW,
+                                                _        => Ds::RED,
+                                            };
+                                            ui.add_space(Ds::SPACE_SM);
+                                            ui.label(RichText::new(format!("{}ms", ms)).size(Ds::FONT_SM).color(color).family(egui::FontFamily::Monospace));
+                                            ui.add_space(4.0);
+                                            ui.label(RichText::new("•").size(Ds::FONT_SM).color(Ds::TEXT_MUTED));
+                                        }
+                                        Some(None) => {
+                                            ui.add_space(Ds::SPACE_SM);
+                                            ui.label(RichText::new("timeout").size(Ds::FONT_SM).color(Ds::RED).family(egui::FontFamily::Monospace));
+                                            ui.add_space(4.0);
+                                            ui.label(RichText::new("•").size(Ds::FONT_SM).color(Ds::TEXT_MUTED));
+                                        }
+                                        None => {} // ainda aguardando primeira medição
+                                    }
+
+                                    // IP/hostname
+                                    ui.add_space(4.0);
+                                    ui.label(RichText::new(&ip).size(Ds::FONT_SM).color(Ds::TEXT_MUTED).family(egui::FontFamily::Monospace));
+                                    ui.add_space(Ds::SPACE_SM);
+                                    ui.label(RichText::new("•").size(Ds::FONT_SM).color(Ds::TEXT_MUTED));
+                                }
+
                                 // Tempo online
                                 if let Some(connected_at) = self.session_connected_at.get(&active_pane) {
                                     let uptime = format_duration(connected_at.elapsed());
