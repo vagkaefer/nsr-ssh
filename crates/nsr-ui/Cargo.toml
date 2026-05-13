@@ -1,0 +1,18 @@
+[package]
+name = "nsr-ui"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+nsr-core = { path = "../nsr-core" }
+nsr-vault = { path = "../nsr-vault" }
+nsr-theme = { path = "../nsr-theme" }
+nsr-plugin = { path = "../nsr-plugin" }
+eframe = { workspace = true }
+egui = { workspace = true }
+vt100 = { workspace = true }
+tokio = { workspace = true }
+anyhow = { workspace = true }
+tracing = { workspace = true }
+uuid = { workspace = true }
+serde = { workspace = true }

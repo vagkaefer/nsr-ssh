@@ -1,0 +1,12 @@
+[package]
+name = "nsr-ssh"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+nsr-ui = { path = "../nsr-ui" }
+nsr-core = { path = "../nsr-core" }
+eframe = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+anyhow = { workspace = true }
