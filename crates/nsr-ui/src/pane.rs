@@ -34,20 +34,107 @@ impl PaneTree {
         }
     }
 
-    pub fn split_horizontal(self, new_session: SessionId) -> Self {
-        PaneTree::HSplit {
-            ratio: 0.5,
-            left: Box::new(self),
-            right: Box::new(PaneTree::Terminal(new_session)),
+    // Divide o pane que contém `target` horizontalmente (lado a lado)
+    pub fn split_h_at(self, target: SessionId, new_session: SessionId) -> Self {
+        match self {
+            PaneTree::Terminal(id) if id == target => PaneTree::HSplit {
+                ratio: 0.5,
+                left: Box::new(PaneTree::Terminal(id)),
+                right: Box::new(PaneTree::Terminal(new_session)),
+            },
+            PaneTree::HSplit { ratio, left, right } => PaneTree::HSplit {
+                ratio,
+                left: Box::new(left.split_h_at(target, new_session)),
+                right: Box::new(right.split_h_at(target, new_session)),
+            },
+            PaneTree::VSplit { ratio, top, bottom } => PaneTree::VSplit {
+                ratio,
+                top: Box::new(top.split_h_at(target, new_session)),
+                bottom: Box::new(bottom.split_h_at(target, new_session)),
+            },
+            other => other,
         }
     }
 
-    pub fn split_vertical(self, new_session: SessionId) -> Self {
-        PaneTree::VSplit {
-            ratio: 0.5,
-            top: Box::new(self),
-            bottom: Box::new(PaneTree::Terminal(new_session)),
+    // Divide o pane que contém `target` verticalmente (cima/baixo)
+    pub fn split_v_at(self, target: SessionId, new_session: SessionId) -> Self {
+        match self {
+            PaneTree::Terminal(id) if id == target => PaneTree::VSplit {
+                ratio: 0.5,
+                top: Box::new(PaneTree::Terminal(id)),
+                bottom: Box::new(PaneTree::Terminal(new_session)),
+            },
+            PaneTree::HSplit { ratio, left, right } => PaneTree::HSplit {
+                ratio,
+                left: Box::new(left.split_v_at(target, new_session)),
+                right: Box::new(right.split_v_at(target, new_session)),
+            },
+            PaneTree::VSplit { ratio, top, bottom } => PaneTree::VSplit {
+                ratio,
+                top: Box::new(top.split_v_at(target, new_session)),
+                bottom: Box::new(bottom.split_v_at(target, new_session)),
+            },
+            other => other,
         }
+    }
+
+    // Fecha o pane que contém `target`; retorna None se a árvore inteira foi removida
+    pub fn close_pane(self, target: SessionId) -> Option<Self> {
+        match self {
+            PaneTree::Terminal(id) if id == target => None,
+            PaneTree::Terminal(_) => Some(self),
+            PaneTree::HSplit { ratio, left, right } => {
+                match (left.close_pane(target), right.close_pane(target)) {
+                    (None, None) => None,
+                    (Some(l), None) => Some(l),
+                    (None, Some(r)) => Some(r),
+                    (Some(l), Some(r)) => Some(PaneTree::HSplit {
+                        ratio,
+                        left: Box::new(l),
+                        right: Box::new(r),
+                    }),
+                }
+            }
+            PaneTree::VSplit { ratio, top, bottom } => {
+                match (top.close_pane(target), bottom.close_pane(target)) {
+                    (None, None) => None,
+                    (Some(t), None) => Some(t),
+                    (None, Some(b)) => Some(b),
+                    (Some(t), Some(b)) => Some(PaneTree::VSplit {
+                        ratio,
+                        top: Box::new(t),
+                        bottom: Box::new(b),
+                    }),
+                }
+            }
+        }
+    }
+
+    // Atualiza o ratio de um split que contém `target`
+    pub fn set_ratio_for(self, target: SessionId, new_ratio: f32) -> Self {
+        match self {
+            PaneTree::HSplit { ratio: _, left, right } if left.contains(target) || right.contains(target) => {
+                PaneTree::HSplit { ratio: new_ratio.clamp(0.1, 0.9), left, right }
+            }
+            PaneTree::VSplit { ratio: _, top, bottom } if top.contains(target) || bottom.contains(target) => {
+                PaneTree::VSplit { ratio: new_ratio.clamp(0.1, 0.9), top, bottom }
+            }
+            PaneTree::HSplit { ratio, left, right } => PaneTree::HSplit {
+                ratio,
+                left: Box::new(left.set_ratio_for(target, new_ratio)),
+                right: Box::new(right.set_ratio_for(target, new_ratio)),
+            },
+            PaneTree::VSplit { ratio, top, bottom } => PaneTree::VSplit {
+                ratio,
+                top: Box::new(top.set_ratio_for(target, new_ratio)),
+                bottom: Box::new(bottom.set_ratio_for(target, new_ratio)),
+            },
+            other => other,
+        }
+    }
+
+    pub fn contains(&self, target: SessionId) -> bool {
+        self.sessions().contains(&target)
     }
 }
 

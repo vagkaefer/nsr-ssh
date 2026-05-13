@@ -1,0 +1,66 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 256 256" width="256" height="256">
+  <defs>
+    <linearGradient id="bg" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" style="stop-color:#282a36"/>
+      <stop offset="100%" style="stop-color:#1e1f2b"/>
+    </linearGradient>
+    <linearGradient id="accent" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" style="stop-color:#bd93f9"/>
+      <stop offset="100%" style="stop-color:#9b6dff"/>
+    </linearGradient>
+    <linearGradient id="glow" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" style="stop-color:#ff79c6"/>
+      <stop offset="100%" style="stop-color:#bd93f9"/>
+    </linearGradient>
+  </defs>
+
+  <!-- Background rounded rect -->
+  <rect width="256" height="256" rx="52" ry="52" fill="url(#bg)"/>
+
+  <!-- Subtle inner border -->
+  <rect x="2" y="2" width="252" height="252" rx="51" ry="51"
+        fill="none" stroke="#bd93f9" stroke-width="2" opacity="0.25"/>
+
+  <!-- Terminal frame -->
+  <rect x="28" y="52" width="200" height="140" rx="10" ry="10"
+        fill="#1a1b26" stroke="#44475a" stroke-width="1.5"/>
+
+  <!-- Title bar -->
+  <rect x="28" y="52" width="200" height="28" rx="10" ry="10" fill="#282a36"/>
+  <rect x="28" y="66" width="200" height="14" fill="#282a36"/>
+
+  <!-- Traffic lights -->
+  <circle cx="52" cy="66" r="6" fill="#ff5555" opacity="0.9"/>
+  <circle cx="72" cy="66" r="6" fill="#f1fa8c" opacity="0.9"/>
+  <circle cx="92" cy="66" r="6" fill="#50fa7b" opacity="0.9"/>
+
+  <!-- Window title text placeholder -->
+  <rect x="108" y="61" width="60" height="10" rx="3" fill="#44475a" opacity="0.5"/>
+
+  <!-- Terminal content lines -->
+  <!-- Prompt line 1 -->
+  <text x="44" y="108" font-family="monospace" font-size="13" fill="#50fa7b" font-weight="bold">$</text>
+  <rect x="56" y="97" width="55" height="10" rx="2" fill="#bd93f9" opacity="0.7"/>
+  <rect x="116" y="97" width="30" height="10" rx="2" fill="#f8f8f2" opacity="0.4"/>
+
+  <!-- Output line -->
+  <rect x="44" y="113" width="90" height="9" rx="2" fill="#6272a4" opacity="0.6"/>
+
+  <!-- Prompt line 2 -->
+  <text x="44" y="138" font-family="monospace" font-size="13" fill="#50fa7b" font-weight="bold">$</text>
+  <rect x="56" y="127" width="40" height="10" rx="2" fill="#8be9fd" opacity="0.7"/>
+
+  <!-- Cursor blink -->
+  <rect x="100" y="127" width="8" height="10" rx="1" fill="url(#accent)" opacity="0.95"/>
+
+  <!-- Output lines 3-4 -->
+  <rect x="44" y="143" width="130" height="8" rx="2" fill="#6272a4" opacity="0.4"/>
+  <rect x="44" y="156" width="80" height="8" rx="2" fill="#6272a4" opacity="0.3"/>
+
+  <!-- Bottom accent bar -->
+  <rect x="28" y="185" width="200" height="3" rx="1.5" fill="url(#accent)" opacity="0.6"/>
+
+  <!-- NSR monogram bottom right -->
+  <text x="196" y="230" font-family="monospace" font-size="18" font-weight="bold"
+        fill="url(#accent)" text-anchor="middle" opacity="0.85">NSR</text>
+</svg>

@@ -33,7 +33,6 @@ struct SessionHandle {
     host: Host,
     state: SessionState,
     input_tx: mpsc::Sender<Vec<u8>>,
-    output_tx: broadcast::Sender<Vec<u8>>,
     cols: u16,
     rows: u16,
 }
@@ -59,17 +58,16 @@ impl SessionManager {
         (Self { sessions, event_tx, command_tx }, event_rx)
     }
 
-    pub async fn connect(&self, host: Host) -> Result<(Uuid, broadcast::Receiver<Vec<u8>>)> {
+    pub async fn connect(&self, host: Host, password: Option<String>) -> Result<(Uuid, mpsc::Receiver<Vec<u8>>)> {
         let session_id = Uuid::new_v4();
         let (input_tx, input_rx) = mpsc::channel::<Vec<u8>>(256);
-        let (output_tx, output_rx) = broadcast::channel::<Vec<u8>>(512);
+        let (output_tx, output_rx) = mpsc::channel::<Vec<u8>>(4096);
 
         let handle = SessionHandle {
             id: session_id,
             host: host.clone(),
             state: SessionState::Connecting,
             input_tx: input_tx.clone(),
-            output_tx: output_tx.clone(),
             cols: 220,
             rows: 50,
         };
@@ -77,10 +75,9 @@ impl SessionManager {
         self.sessions.lock().await.push(handle);
 
         let event_tx = self.event_tx.clone();
-        let output_tx_clone = output_tx.clone();
 
         tokio::spawn(async move {
-            run_ssh_session(session_id, host, input_rx, output_tx_clone, event_tx).await;
+            run_ssh_session(session_id, host, password, input_rx, output_tx, event_tx).await;
         });
 
         Ok((session_id, output_rx))
@@ -98,7 +95,13 @@ impl SessionManager {
     }
 
     pub async fn resize(&self, session_id: Uuid, cols: u16, rows: u16) {
-        let _ = self.command_tx.send(AppCommand::Resize { session_id, cols, rows }).await;
+        // Envia magic resize packet pela fila de input da sessão
+        let resize_packet = vec![
+            0x00, 0xFF,
+            (cols >> 8) as u8, cols as u8,
+            (rows >> 8) as u8, rows as u8,
+        ];
+        self.send_input(session_id, resize_packet).await;
     }
 
     pub fn event_receiver(&self) -> broadcast::Receiver<SessionEvent> {
@@ -109,8 +112,9 @@ impl SessionManager {
 async fn run_ssh_session(
     session_id: Uuid,
     host: Host,
+    password: Option<String>,
     mut input_rx: mpsc::Receiver<Vec<u8>>,
-    output_tx: broadcast::Sender<Vec<u8>>,
+    output_tx: mpsc::Sender<Vec<u8>>,
     event_tx: broadcast::Sender<SessionEvent>,
 ) {
     info!("Conectando em {}@{}:{}", host.user, host.hostname, host.port);
@@ -139,8 +143,8 @@ async fn run_ssh_session(
         }
     };
 
-    // Tenta autenticação com SSH agent primeiro, depois chave privada
-    let auth_ok = try_authenticate(&mut session, &host).await;
+    // Tenta autenticação: chave privada → senha → padrão
+    let auth_ok = try_authenticate(&mut session, &host, password).await;
 
     if !auth_ok {
         let _ = event_tx.send(SessionEvent::Error {
@@ -185,7 +189,12 @@ async fn run_ssh_session(
     loop {
         tokio::select! {
             Some(data) = input_rx.recv() => {
-                if let Err(e) = channel.data(data.as_slice()).await {
+                // Resize request: marcado com magic prefix [0x00, 0xFF, cols_hi, cols_lo, rows_hi, rows_lo]
+                if data.len() == 6 && data[0] == 0x00 && data[1] == 0xFF {
+                    let cols = u16::from_be_bytes([data[2], data[3]]);
+                    let rows = u16::from_be_bytes([data[4], data[5]]);
+                    let _ = channel.window_change(cols as u32, rows as u32, 0, 0).await;
+                } else if let Err(e) = channel.data(data.as_slice()).await {
                     error!("Erro ao enviar dados para {}: {}", session_id, e);
                     break;
                 }
@@ -193,10 +202,12 @@ async fn run_ssh_session(
             msg = channel.wait() => {
                 match msg {
                     Some(russh::ChannelMsg::Data { ref data }) => {
-                        let _ = output_tx.send(data.to_vec());
+                        if output_tx.send(data.to_vec()).await.is_err() {
+                            break;
+                        }
                     }
                     Some(russh::ChannelMsg::ExtendedData { ref data, .. }) => {
-                        let _ = output_tx.send(data.to_vec());
+                        let _ = output_tx.send(data.to_vec()).await;
                     }
                     Some(russh::ChannelMsg::ExitStatus { .. }) | None => {
                         info!("Canal SSH {} fechado", session_id);
@@ -211,31 +222,52 @@ async fn run_ssh_session(
     let _ = event_tx.send(SessionEvent::Disconnected { session_id });
 }
 
-async fn try_authenticate(session: &mut client::Handle<SshClientHandler>, host: &Host) -> bool {
-    // 1. Tenta autenticação com chave privada especificada
+async fn try_authenticate(
+    session: &mut client::Handle<SshClientHandler>,
+    host: &Host,
+    password: Option<String>,
+) -> bool {
+    // Pega o melhor hash RSA suportado pelo servidor (None para ed25519/ecdsa)
+    let rsa_hash = session.best_supported_rsa_hash().await
+        .ok()
+        .flatten()
+        .flatten();
+
+    let try_key = |key: russh::keys::PrivateKey| {
+        russh::keys::PrivateKeyWithHashAlg::new(Arc::new(key), rsa_hash.clone())
+    };
+
+    // 1. Chave privada especificada no host
     if let Some(ref id_file) = host.identity_file {
         let expanded = shellexpand::tilde(id_file).into_owned();
         if let Ok(key) = russh::keys::load_secret_key(&expanded, None) {
-            let key = russh::keys::PrivateKeyWithHashAlg::new(
-                Arc::new(key),
-                None,
-            );
-            if let Ok(result) = session.authenticate_publickey(&host.user, key).await {
+            if let Ok(result) = session.authenticate_publickey(&host.user, try_key(key)).await {
                 if result.success() {
+                    info!("Auth via identity_file OK");
                     return true;
                 }
             }
         }
     }
 
-    // 2. Tenta chaves padrão
+    // 2. Senha fornecida pelo usuário
+    if let Some(ref pwd) = password {
+        if let Ok(result) = session.authenticate_password(&host.user, pwd).await {
+            if result.success() {
+                info!("Auth via password OK");
+                return true;
+            }
+        }
+    }
+
+    // 3. Chaves padrão (~/.ssh/id_*)
     for default_key in &["~/.ssh/id_ed25519", "~/.ssh/id_rsa", "~/.ssh/id_ecdsa"] {
         let expanded = shellexpand::tilde(default_key).into_owned();
         if std::path::Path::new(&expanded).exists() {
             if let Ok(key) = russh::keys::load_secret_key(&expanded, None) {
-                let key = russh::keys::PrivateKeyWithHashAlg::new(Arc::new(key), None);
-                if let Ok(result) = session.authenticate_publickey(&host.user, key).await {
+                if let Ok(result) = session.authenticate_publickey(&host.user, try_key(key)).await {
                     if result.success() {
+                        info!("Auth via default key {} OK", default_key);
                         return true;
                     }
                 }
@@ -243,11 +275,12 @@ async fn try_authenticate(session: &mut client::Handle<SshClientHandler>, host: 
         }
     }
 
+    warn!("Todas as tentativas de autenticação falharam para {}@{}", host.user, host.hostname);
     false
 }
 
 struct SshClientHandler {
-    output_tx: broadcast::Sender<Vec<u8>>,
+    output_tx: mpsc::Sender<Vec<u8>>,
 }
 
 impl client::Handler for SshClientHandler {

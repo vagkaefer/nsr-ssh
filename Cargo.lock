@@ -2780,6 +2780,8 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "eframe",
+ "egui",
+ "image",
  "nsr-core",
  "nsr-ui",
  "tracing",
@@ -2801,6 +2803,9 @@ name = "nsr-ui"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "arboard",
+ "chrono",
+ "dirs",
  "eframe",
  "egui",
  "nsr-core",

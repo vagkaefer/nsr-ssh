@@ -7,6 +7,8 @@ edition = "2021"
 nsr-ui = { path = "../nsr-ui" }
 nsr-core = { path = "../nsr-core" }
 eframe = { workspace = true }
+egui = { workspace = true }
+image = { version = "0.25", default-features = false, features = ["png"] }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 anyhow = { workspace = true }

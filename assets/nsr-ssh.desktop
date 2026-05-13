@@ -1,0 +1,13 @@
+[Desktop Entry]
+Version=1.0
+Type=Application
+Name=NSR-SSH
+GenericName=SSH Client
+Comment=No Subscription Required SSH Client
+Exec=nsr-ssh
+Icon=nsr-ssh
+Terminal=false
+Categories=Network;RemoteAccess;System;
+Keywords=ssh;terminal;remote;connection;
+StartupWMClass=nsr-ssh
+StartupNotify=true

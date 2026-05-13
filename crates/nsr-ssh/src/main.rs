@@ -11,11 +11,20 @@ fn main() -> eframe::Result<()> {
         )
         .init();
 
+    let icon = load_icon();
+
+    let mut viewport = ViewportBuilder::default()
+        .with_title("NSR-SSH")
+        .with_app_id("nsr-ssh")   // deve bater com o nome do .desktop no Wayland
+        .with_inner_size([1280.0, 800.0])
+        .with_min_inner_size([800.0, 500.0]);
+
+    if let Some(icon_data) = icon {
+        viewport = viewport.with_icon(std::sync::Arc::new(icon_data));
+    }
+
     let options = NativeOptions {
-        viewport: ViewportBuilder::default()
-            .with_title("NSR-SSH")
-            .with_inner_size([1280.0, 800.0])
-            .with_min_inner_size([800.0, 500.0]),
+        viewport,
         ..Default::default()
     };
 
@@ -24,4 +33,17 @@ fn main() -> eframe::Result<()> {
         options,
         Box::new(|cc| Ok(Box::new(nsr_ui::NsrApp::new(cc)))),
     )
+}
+
+fn load_icon() -> Option<egui::IconData> {
+    // PNG embutido em compile-time — sem dep extra em runtime
+    let bytes = include_bytes!("../../../assets/icons/nsr-ssh-128.png");
+    let img = image::load_from_memory(bytes).ok()?;
+    let rgba = img.to_rgba8();
+    let (w, h) = rgba.dimensions();
+    Some(egui::IconData {
+        rgba: rgba.into_raw(),
+        width: w,
+        height: h,
+    })
 }
