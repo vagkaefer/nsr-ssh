@@ -19,12 +19,15 @@ pub struct ConnectDialog {
     tags_str: String,
     id_file_str: String,
     desc_str: String,
+    ssh_options_str: String,
+    show_advanced: bool,
 }
 
 pub struct ConnectRequest {
     pub host: Host,
     pub password: Option<String>,
     pub save_to_vault: bool,
+    pub connect: bool,
 }
 
 impl ConnectDialog {
@@ -41,6 +44,7 @@ impl ConnectDialog {
                 identity_file: Some("~/.ssh/id_rsa".into()),
                 tags: vec![],
                 description: None,
+                ssh_options: None,
             },
             password: String::new(),
             auth_tab: AuthTab::Key,
@@ -48,6 +52,8 @@ impl ConnectDialog {
             tags_str: String::new(),
             id_file_str: "~/.ssh/id_rsa".into(),
             desc_str: String::new(),
+            ssh_options_str: String::new(),
+            show_advanced: false,
         }
     }
 
@@ -62,6 +68,7 @@ impl ConnectDialog {
             identity_file: Some("~/.ssh/id_rsa".into()),
             tags: vec![],
             description: None,
+            ssh_options: None,
         };
         self.password = String::new();
         self.auth_tab = AuthTab::Key;
@@ -69,6 +76,8 @@ impl ConnectDialog {
         self.tags_str = String::new();
         self.id_file_str = "~/.ssh/id_rsa".into();
         self.desc_str = String::new();
+        self.ssh_options_str = String::new();
+        self.show_advanced = false;
         self.open = true;
     }
 
@@ -80,6 +89,8 @@ impl ConnectDialog {
         self.tags_str = host.tags.join(", ");
         self.id_file_str = host.identity_file.clone().unwrap_or_else(|| "~/.ssh/id_rsa".into());
         self.desc_str = host.description.clone().unwrap_or_default();
+        self.ssh_options_str = host.ssh_options.clone().unwrap_or_default();
+        self.show_advanced = host.ssh_options.is_some();
         self.open = true;
     }
 
@@ -197,12 +208,36 @@ impl ConnectDialog {
 
                 match self.auth_tab {
                     AuthTab::Key => {
-                        ui.add(
-                            egui::TextEdit::singleline(&mut self.id_file_str)
-                                .hint_text("~/.ssh/id_rsa")
-                                .desired_width(f32::INFINITY)
-                                .font(egui::FontId::monospace(Ds::FONT_SM)),
-                        );
+                        ui.horizontal(|ui| {
+                            let changed = ui.add(
+                                egui::TextEdit::singleline(&mut self.id_file_str)
+                                    .hint_text("~/.ssh/id_rsa")
+                                    .desired_width(ui.available_width() - 36.0)
+                                    .font(egui::FontId::monospace(Ds::FONT_SM)),
+                            ).changed();
+                            let browse = ui.add(
+                                egui::Button::new(RichText::new("…").size(Ds::FONT_MD).color(Ds::TEXT_SECONDARY))
+                                    .fill(Ds::BG_HOVER)
+                                    .stroke(Stroke::new(1.0, Ds::BORDER))
+                                    .min_size(Vec2::new(28.0, 0.0)),
+                            );
+                            if browse.clicked() {
+                                if let Some(path) = rfd::FileDialog::new()
+                                    .set_title("Selecionar chave SSH")
+                                    .set_directory(dirs::home_dir().unwrap_or_default().join(".ssh"))
+                                    .pick_file()
+                                {
+                                    self.id_file_str = path.to_string_lossy().into_owned();
+                                }
+                            }
+                            if changed || browse.clicked() {
+                                self.host.identity_file = if self.id_file_str.is_empty() {
+                                    None
+                                } else {
+                                    Some(self.id_file_str.clone())
+                                };
+                            }
+                        });
                         self.host.identity_file = if self.id_file_str.is_empty() {
                             None
                         } else {
@@ -257,6 +292,35 @@ impl ConnectDialog {
                         Some(self.desc_str.clone())
                     };
                 }
+                ui.add_space(Ds::SPACE_SM);
+
+                // ── Opções SSH avançadas ──────────────────────────────────────
+                let adv_label = if self.show_advanced { "▾ Opções SSH avançadas" } else { "▸ Opções SSH avançadas" };
+                if ui.add(
+                    egui::Button::new(RichText::new(adv_label).color(Ds::TEXT_MUTED).size(Ds::FONT_SM))
+                        .fill(Color32::TRANSPARENT)
+                        .stroke(Stroke::NONE),
+                ).clicked() {
+                    self.show_advanced = !self.show_advanced;
+                }
+
+                if self.show_advanced {
+                    ui.add_space(2.0);
+                    field_label(ui, "Opções extras  (-o Chave=Valor, uma por linha)");
+                    if ui.add(
+                        egui::TextEdit::multiline(&mut self.ssh_options_str)
+                            .hint_text("StrictHostKeyChecking=no\nUserKnownHostsFile=/dev/null\nRequiredRSASize=256")
+                            .desired_width(f32::INFINITY)
+                            .desired_rows(3)
+                            .font(egui::FontId::monospace(Ds::FONT_SM)),
+                    ).changed() {
+                        self.host.ssh_options = if self.ssh_options_str.trim().is_empty() {
+                            None
+                        } else {
+                            Some(self.ssh_options_str.clone())
+                        };
+                    }
+                }
 
                 ui.add_space(Ds::SPACE_LG);
                 ui.add(egui::Separator::default().spacing(Ds::SPACE_SM));
@@ -267,7 +331,7 @@ impl ConnectDialog {
                     && !self.host.user.trim().is_empty();
 
                 ui.horizontal(|ui| {
-                    // Conectar (sem salvar)
+                    // ⚡ Conectar (sem salvar)
                     if ui.add_enabled(
                         can_connect,
                         egui::Button::new(
@@ -279,15 +343,15 @@ impl ConnectDialog {
                         .fill(if can_connect { Ds::ACCENT } else { Ds::BG_ACTIVE })
                         .stroke(Stroke::NONE)
                         .corner_radius(Ds::R_SM)
-                        .min_size(Vec2::new(120.0, 32.0)),
+                        .min_size(Vec2::new(110.0, 32.0)),
                     ).clicked() {
-                        result = Some(self.build_request(false));
+                        result = Some(self.build_request(false, true));
                         should_close = true;
                     }
 
                     ui.add_space(Ds::SPACE_XS);
 
-                    // Salvar no vault & conectar
+                    // 💾 Salvar & Conectar
                     if ui.add_enabled(
                         can_connect,
                         egui::Button::new(
@@ -298,9 +362,30 @@ impl ConnectDialog {
                         .fill(if can_connect { Ds::ACCENT_DIM } else { Ds::BG_PANEL })
                         .stroke(Stroke::new(1.0, if can_connect { Ds::ACCENT } else { Ds::BORDER }))
                         .corner_radius(Ds::R_SM)
-                        .min_size(Vec2::new(150.0, 32.0)),
+                        .min_size(Vec2::new(148.0, 32.0)),
                     ).clicked() {
-                        result = Some(self.build_request(true));
+                        result = Some(self.build_request(true, true));
+                        should_close = true;
+                    }
+
+                    ui.add_space(Ds::SPACE_XS);
+
+                    // 💾 Somente Salvar (sem conectar)
+                    let can_save = !self.host.alias.trim().is_empty()
+                        && !self.host.hostname.trim().is_empty();
+                    if ui.add_enabled(
+                        can_save,
+                        egui::Button::new(
+                            RichText::new("Salvar")
+                                .color(if can_save { Ds::TEXT_PRIMARY } else { Ds::TEXT_MUTED })
+                                .size(Ds::FONT_MD),
+                        )
+                        .fill(Ds::BG_PANEL)
+                        .stroke(Stroke::new(1.0, if can_save { Ds::BORDER } else { Ds::BG_ACTIVE }))
+                        .corner_radius(Ds::R_SM)
+                        .min_size(Vec2::new(72.0, 32.0)),
+                    ).clicked() {
+                        result = Some(self.build_request(true, false));
                         should_close = true;
                     }
 
@@ -327,9 +412,8 @@ impl ConnectDialog {
         result
     }
 
-    fn build_request(&self, save_to_vault: bool) -> ConnectRequest {
+    fn build_request(&self, save_to_vault: bool, connect: bool) -> ConnectRequest {
         let mut host = self.host.clone();
-        // Se alias vazio, usa o hostname como alias
         if host.alias.trim().is_empty() {
             host.alias = host.hostname.clone();
         }
@@ -340,6 +424,7 @@ impl ConnectDialog {
             },
             host,
             save_to_vault,
+            connect,
         }
     }
 }

@@ -5,6 +5,7 @@ pub mod pane;
 pub mod settings;
 pub mod tab_bar;
 pub mod terminal_widget;
+pub mod updater;
 pub mod vault_panel;
 
 pub use app::NsrApp;

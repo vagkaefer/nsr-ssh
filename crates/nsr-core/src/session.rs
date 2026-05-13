@@ -30,7 +30,9 @@ pub struct Session {
 
 struct SessionHandle {
     id: Uuid,
+    #[allow(dead_code)]
     host: Host,
+    #[allow(dead_code)]
     state: SessionState,
     input_tx: mpsc::Sender<Vec<u8>>,
     cols: u16,
@@ -280,6 +282,7 @@ async fn try_authenticate(
 }
 
 struct SshClientHandler {
+    #[allow(dead_code)]
     output_tx: mpsc::Sender<Vec<u8>>,
 }
 
