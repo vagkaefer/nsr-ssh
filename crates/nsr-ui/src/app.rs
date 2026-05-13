@@ -70,6 +70,9 @@ pub struct NsrApp {
     status_message: String,
     status_ok: bool,
     update_state: UpdateState,
+    // Sync automático do vault: mtime do arquivo na pasta de sync
+    sync_vault_mtime: Option<SystemTime>,
+    last_sync_check: Instant,
 }
 
 impl NsrApp {
@@ -138,6 +141,8 @@ impl NsrApp {
             status_message: "Pronto".into(),
             status_ok: true,
             update_state,
+            sync_vault_mtime: None,
+            last_sync_check: Instant::now(),
         }
     }
 
@@ -722,7 +727,167 @@ impl NsrApp {
             VaultAction::Edit(host) => {
                 self.connect_dialog.open_with_host(&host);
             }
-            VaultAction::Export | VaultAction::Import => {}
+            VaultAction::Export => {
+                self.export_vault();
+            }
+            VaultAction::Import => {
+                self.import_vault();
+            }
+        }
+    }
+
+    fn export_vault(&mut self) {
+        use nsr_vault::export_json;
+        match export_json(&self.hosts) {
+            Ok(json) => {
+                let dialog = rfd::FileDialog::new()
+                    .set_file_name("vault.json")
+                    .add_filter("JSON", &["json"]);
+                if let Some(path) = dialog.save_file() {
+                    match std::fs::write(&path, &json) {
+                        Ok(()) => {
+                            self.status_message = format!("Vault exportado para {}", path.display());
+                            self.status_ok = true;
+                        }
+                        Err(e) => {
+                            self.status_message = format!("Erro ao exportar: {}", e);
+                            self.status_ok = false;
+                        }
+                    }
+                }
+            }
+            Err(e) => {
+                self.status_message = format!("Erro ao serializar vault: {}", e);
+                self.status_ok = false;
+            }
+        }
+    }
+
+    fn import_vault(&mut self) {
+        use nsr_vault::import_json;
+        let dialog = rfd::FileDialog::new().add_filter("JSON", &["json"]);
+        if let Some(path) = dialog.pick_file() {
+            match std::fs::read_to_string(&path) {
+                Ok(json) => match import_json(&json) {
+                    Ok(imported) => {
+                        let mut added = 0;
+                        for host in imported {
+                            if !self.hosts.iter().any(|h| h.id == host.id || h.alias == host.alias) {
+                                self.hosts.push(host);
+                                added += 1;
+                            }
+                        }
+                        self.persist_hosts();
+                        self.status_message = format!("{} host(s) importado(s) de {}", added, path.display());
+                        self.status_ok = true;
+                    }
+                    Err(e) => {
+                        self.status_message = format!("Erro ao ler JSON: {}", e);
+                        self.status_ok = false;
+                    }
+                },
+                Err(e) => {
+                    self.status_message = format!("Erro ao abrir arquivo: {}", e);
+                    self.status_ok = false;
+                }
+            }
+        }
+    }
+
+    fn check_vault_sync(&mut self) {
+        const INTERVAL: Duration = Duration::from_secs(3);
+        if self.last_sync_check.elapsed() < INTERVAL {
+            return;
+        }
+        self.last_sync_check = Instant::now();
+
+        let sync_path = self.settings.sync_vault_path.trim().to_string();
+        if sync_path.is_empty() {
+            return;
+        }
+
+        // Expande ~ manualmente
+        let sync_dir = if sync_path.starts_with('~') {
+            if let Some(home) = dirs::home_dir() {
+                home.join(&sync_path[2..])
+            } else {
+                return;
+            }
+        } else {
+            std::path::PathBuf::from(&sync_path)
+        };
+
+        let sync_file = sync_dir.join("vault.json");
+
+        // Lê mtime
+        let mtime = std::fs::metadata(&sync_file).ok().and_then(|m| m.modified().ok());
+        if mtime == self.sync_vault_mtime {
+            return;
+        }
+
+        // Mudou ou primeira vez — tenta importar
+        let prev_mtime = self.sync_vault_mtime;
+        self.sync_vault_mtime = mtime;
+
+        if mtime.is_none() {
+            // Arquivo não existe → escreve vault local lá
+            self.write_sync_vault(&sync_file);
+            return;
+        }
+
+        if prev_mtime.is_none() {
+            // Primeira detecção do arquivo → importa sem sobrescrever
+        }
+
+        match std::fs::read_to_string(&sync_file) {
+            Ok(json) => match nsr_vault::import_json(&json) {
+                Ok(remote_hosts) => {
+                    let mut added = 0;
+                    let mut updated = 0;
+                    for remote in remote_hosts {
+                        if let Some(local) = self.hosts.iter_mut().find(|h| h.id == remote.id) {
+                            // Mesmo ID — atualiza se o remote for mais recente (sem timestamp,
+                            // adotamos remote como autoridade quando o arquivo muda externamente)
+                            if local.alias != remote.alias
+                                || local.hostname != remote.hostname
+                                || local.user != remote.user
+                                || local.port != remote.port
+                            {
+                                *local = remote;
+                                updated += 1;
+                            }
+                        } else if !self.hosts.iter().any(|h| h.alias == remote.alias) {
+                            self.hosts.push(remote);
+                            added += 1;
+                        }
+                    }
+                    if added > 0 || updated > 0 {
+                        self.persist_hosts();
+                        // Após salvar localmente, escreve de volta para sync (inclui hosts locais extras)
+                        self.write_sync_vault(&sync_file);
+                        self.status_message = format!(
+                            "Sync: +{} novo(s), {} atualizado(s)",
+                            added, updated
+                        );
+                        self.status_ok = true;
+                    }
+                }
+                Err(_) => {} // JSON inválido — ignora silenciosamente
+            },
+            Err(_) => {}
+        }
+    }
+
+    fn write_sync_vault(&mut self, path: &std::path::Path) {
+        use nsr_vault::export_json;
+        if let Some(parent) = path.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        if let Ok(json) = export_json(&self.hosts) {
+            if let Ok(()) = std::fs::write(path, &json) {
+                // Atualiza mtime para não disparar reimport da própria escrita
+                self.sync_vault_mtime = std::fs::metadata(path).ok().and_then(|m| m.modified().ok());
+            }
         }
     }
 
@@ -740,6 +905,17 @@ impl NsrApp {
                     self.status_ok = false;
                 }
             }
+        }
+        // Propaga para a pasta de sync se configurada
+        let sync_path = self.settings.sync_vault_path.trim().to_string();
+        if !sync_path.is_empty() {
+            let sync_dir = if sync_path.starts_with('~') {
+                dirs::home_dir().map(|h| h.join(&sync_path[2..])).unwrap_or_default()
+            } else {
+                std::path::PathBuf::from(&sync_path)
+            };
+            let sync_file = sync_dir.join("vault.json");
+            self.write_sync_vault(&sync_file);
         }
     }
 
@@ -1251,6 +1427,7 @@ impl eframe::App for NsrApp {
         self.process_session_events();
         self.drain_output_receivers();
         self.check_ssh_config_changes();
+        self.check_vault_sync();
         self.update_latencies();
 
         Ds::apply_global_visuals(&ctx);
