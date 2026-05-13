@@ -81,24 +81,40 @@ impl TabBar {
                 );
             }
 
-            // Botões à direita: settings
+            // Botões à direita
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 ui.add_space(Ds::SPACE_SM);
-                let gear = ui.add(
-                    egui::Button::new(
-                        RichText::new("⚙").color(Ds::TEXT_SECONDARY).size(14.0),
-                    )
-                    .fill(Color32::TRANSPARENT)
-                    .stroke(Stroke::NONE),
-                );
-                if gear.clicked() {
-                    action = Some(TabBarAction::OpenSettings);
+
+                let gear = tab_icon_btn(ui, "⚙", "Configurações  (Ctrl+,)");
+                if gear.clicked() { action = Some(TabBarAction::OpenSettings); }
+
+                if !tabs.is_empty() {
+                    ui.add_space(2.0);
+                    let sv = tab_icon_btn(ui, "⊟", "Split vertical  (Ctrl+Shift+-)");
+                    if sv.clicked() {
+                        if let Some(id) = active_tab { action = Some(TabBarAction::SplitV(id)); }
+                    }
+                    ui.add_space(2.0);
+                    let sh = tab_icon_btn(ui, "⊞", "Split horizontal  (Ctrl+Shift+\\)");
+                    if sh.clicked() {
+                        if let Some(id) = active_tab { action = Some(TabBarAction::SplitH(id)); }
+                    }
                 }
             });
         });
 
         action
     }
+}
+
+fn tab_icon_btn(ui: &mut Ui, icon: &str, tooltip: &str) -> egui::Response {
+    let btn = ui.add(
+        egui::Button::new(RichText::new(icon).color(Ds::TEXT_SECONDARY).size(15.0))
+            .fill(Color32::TRANSPARENT)
+            .stroke(Stroke::NONE)
+            .min_size(Vec2::new(28.0, 28.0)),
+    );
+    btn.on_hover_text(tooltip)
 }
 
 fn draw_tab(ui: &mut Ui, title: &str, is_active: bool, tab_id: Uuid) -> Option<TabBarAction> {
@@ -114,7 +130,7 @@ fn draw_tab(ui: &mut Ui, title: &str, is_active: bool, tab_id: Uuid) -> Option<T
     );
     let tab_w = (title_galley.size().x + padding.x * 2.0 + Ds::SPACE_MD + 20.0).max(100.0).min(200.0);
 
-    let (tab_rect, resp) = ui.allocate_exact_size(Vec2::new(tab_w, h), egui::Sense::click());
+    let (tab_rect, resp) = ui.allocate_exact_size(Vec2::new(tab_w, h), egui::Sense::click_and_drag());
 
     let bg = if is_active {
         Ds::BG_TAB_ACTIVE
@@ -166,19 +182,47 @@ fn draw_tab(ui: &mut Ui, title: &str, is_active: bool, tab_id: Uuid) -> Option<T
         );
     }
 
+    // Drag iniciado — notifica app para mostrar zonas de drop
+    if resp.drag_started() && !close_hovered {
+        action = Some(TabBarAction::StartDrag(tab_id));
+    }
+    if resp.drag_stopped() {
+        action = Some(TabBarAction::EndDrag);
+    }
+
+    // Feedback visual durante drag: ghost da aba segue o cursor em layer global
+    if resp.dragged() {
+        let drag_pos = resp.interact_pointer_pos().unwrap_or(tab_rect.center());
+        let ghost_painter = ui.ctx().layer_painter(egui::LayerId::new(
+            egui::Order::Tooltip,
+            egui::Id::new("tab_ghost"),
+        ));
+        let ghost_rect = Rect::from_center_size(drag_pos, Vec2::new(tab_w, h * 0.85));
+        ghost_painter.rect_filled(
+            ghost_rect,
+            CornerRadius::same(4),
+            Color32::from_rgba_premultiplied(
+                Ds::ACCENT.r(), Ds::ACCENT.g(), Ds::ACCENT.b(), 180,
+            ),
+        );
+        ghost_painter.text(
+            drag_pos,
+            egui::Align2::CENTER_CENTER,
+            title,
+            egui::FontId::proportional(Ds::FONT_MD),
+            Color32::WHITE,
+        );
+    }
+
     // Context menu
     resp.context_menu(|ui| {
-        ui.set_min_width(160.0);
+        ui.set_min_width(180.0);
         if ui.button("Duplicar aba").clicked() {
             action = Some(TabBarAction::Duplicate(tab_id));
             ui.close();
         }
-        if ui.button("Split horizontal").clicked() {
-            action = Some(TabBarAction::SplitH(tab_id));
-            ui.close();
-        }
-        if ui.button("Split vertical").clicked() {
-            action = Some(TabBarAction::SplitV(tab_id));
+        if ui.button("Restaurar pane →  nova aba").clicked() {
+            action = Some(TabBarAction::DetachPane(tab_id));
             ui.close();
         }
         ui.separator();
@@ -209,4 +253,7 @@ pub enum TabBarAction {
     SplitH(Uuid),
     SplitV(Uuid),
     OpenSettings,
+    StartDrag(Uuid),
+    EndDrag,
+    DetachPane(Uuid),
 }

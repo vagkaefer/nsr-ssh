@@ -1,5 +1,6 @@
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant, SystemTime};
 use egui::{Key, Modifiers, Pos2, Rect, RichText, Stroke, Vec2};
 use egui::epaint::CornerRadius;
 use tokio::sync::{broadcast, mpsc};
@@ -33,6 +34,8 @@ struct PaneResult {
     toggle_recording: Option<Uuid>,
     reconnect: Option<Uuid>,
     close_pane: Option<Uuid>,
+    split_h: Option<Uuid>,
+    split_v: Option<Uuid>,
 }
 
 pub struct NsrApp {
@@ -44,6 +47,7 @@ pub struct NsrApp {
     terminal_buffers: HashMap<Uuid, Arc<Mutex<TerminalBuffer>>>,
     output_receivers: HashMap<Uuid, mpsc::Receiver<Vec<u8>>>,
     pane_states: HashMap<Uuid, PaneState>,
+    session_connected_at: HashMap<Uuid, Instant>,
 
     session_manager: Arc<SessionManager>,
     event_rx: broadcast::Receiver<SessionEvent>,
@@ -55,6 +59,9 @@ pub struct NsrApp {
 
     rt: Arc<tokio::runtime::Runtime>,
     show_vault: bool,
+    welcome_search: String,
+    ssh_config_mtime: Option<SystemTime>,
+    dragging_tab: Option<Uuid>,      // tab_id sendo arrastado
     status_message: String,
     status_ok: bool,
 }
@@ -72,10 +79,22 @@ impl NsrApp {
         let session_manager = Arc::new(session_manager);
 
         let vault_store = VaultStore::new().ok();
-        let hosts = vault_store
+        let mut hosts = vault_store
             .as_ref()
             .and_then(|s| s.load_hosts().ok())
             .unwrap_or_default();
+
+        // Merge hosts do ~/.ssh/config que ainda não estão no vault
+        if let Some(ref store) = vault_store {
+            if let Ok(new_from_config) = store.new_hosts_from_ssh_config(&hosts) {
+                if !new_from_config.is_empty() {
+                    hosts.extend(new_from_config);
+                    let _ = store.save_hosts(&hosts);
+                }
+            }
+        }
+        // Lê mtime APÓS o possível save inicial para não disparar check no primeiro frame
+        let initial_mtime = vault_store.as_ref().and_then(|s| s.ssh_config_mtime());
 
         let themes = load_user_themes();
         let theme = themes.into_iter().next().unwrap_or_else(nsr_theme::builtin::dracula);
@@ -89,14 +108,18 @@ impl NsrApp {
             terminal_buffers: HashMap::new(),
             output_receivers: HashMap::new(),
             pane_states: HashMap::new(),
+            session_connected_at: HashMap::new(),
             session_manager,
             event_rx,
+            ssh_config_mtime: initial_mtime,
             vault_store,
             vault_panel: VaultPanel::new(),
             connect_dialog: ConnectDialog::new(),
             settings: SettingsPanel::new(&theme_name),
             rt,
             show_vault: true,
+            welcome_search: String::new(),
+            dragging_tab: None,
             status_message: "Pronto".into(),
             status_ok: true,
         }
@@ -253,6 +276,43 @@ impl NsrApp {
         }
     }
 
+    fn check_ssh_config_changes(&mut self) {
+        let Some(ref store) = self.vault_store else { return };
+        let current_mtime = store.ssh_config_mtime();
+        if current_mtime == self.ssh_config_mtime {
+            return;
+        }
+        self.ssh_config_mtime = current_mtime;
+
+        match store.new_hosts_from_ssh_config(&self.hosts) {
+            Ok(new_hosts) if !new_hosts.is_empty() => {
+                let count = new_hosts.len();
+                self.hosts.extend(new_hosts);
+                self.persist_hosts();
+                self.status_message = format!("{} novo(s) host(s) importado(s) do ~/.ssh/config", count);
+                self.status_ok = true;
+            }
+            Ok(_) => {
+                // arquivo mudou mas sem novos hosts (edição de entradas existentes)
+                // reimporta atualizações de hosts existentes pelo alias
+                if let Ok(imported) = store.import_from_ssh_config() {
+                    for imported_host in imported {
+                        if let Some(existing) = self.hosts.iter_mut().find(|h| h.alias == imported_host.alias) {
+                            existing.hostname = imported_host.hostname;
+                            existing.user = imported_host.user;
+                            existing.port = imported_host.port;
+                            if imported_host.identity_file.is_some() {
+                                existing.identity_file = imported_host.identity_file;
+                            }
+                        }
+                    }
+                    self.persist_hosts();
+                }
+            }
+            Err(_) => {}
+        }
+    }
+
     fn drain_output_receivers(&mut self) {
         let ids: Vec<Uuid> = self.output_receivers.keys().copied().collect();
         for sid in ids {
@@ -277,15 +337,16 @@ impl NsrApp {
             match self.event_rx.try_recv() {
                 Ok(SessionEvent::Connected { session_id }) => {
                     self.pane_states.insert(session_id, PaneState::Connected);
+                    self.session_connected_at.insert(session_id, Instant::now());
                     self.status_message = "Conectado".into();
                     self.status_ok = true;
                 }
                 Ok(SessionEvent::Disconnected { session_id }) => {
-                    // Só marca desconectado se ainda não tem erro (evita sobrescrever mensagem de erro)
                     let entry = self.pane_states.entry(session_id).or_insert(PaneState::Connecting);
                     if matches!(entry, PaneState::Connected | PaneState::Connecting) {
                         *entry = PaneState::Disconnected { error: None };
                     }
+                    self.session_connected_at.remove(&session_id);
                     self.status_message = "Desconectado".into();
                     self.status_ok = false;
                 }
@@ -360,6 +421,7 @@ impl NsrApp {
                                 if save_content_requested { result.save_content = Some(sid); }
                                 if toggle_recording { result.toggle_recording = Some(sid); }
 
+
                                 if let Some((cols, rows)) = resize {
                                     let sm = session_manager.clone();
                                     rt.block_on(async { sm.resize(sid, cols, rows).await });
@@ -403,25 +465,30 @@ impl NsrApp {
 
                 let mut result = PaneResult::default();
 
-                let left_resp = ui.allocate_ui(Vec2::new(left_w, avail.y), |ui| {
-                    Self::render_pane_tree(ui, left, active_pane, terminal_buffers, pane_states, font_size, session_manager, rt)
-                });
-                merge_pane_result(&mut result, left_resp.inner);
+                // Layout horizontal explícito para side-by-side
+                ui.with_layout(egui::Layout::left_to_right(egui::Align::TOP), |ui| {
+                    ui.spacing_mut().item_spacing = Vec2::ZERO;
 
-                let (sep_rect, sep_resp) = ui.allocate_exact_size(Vec2::new(SEP, avail.y), egui::Sense::drag());
-                let sep_color = if sep_resp.hovered() || sep_resp.dragged() { Ds::ACCENT } else { Ds::BORDER };
-                ui.painter().rect_filled(sep_rect, CornerRadius::ZERO, sep_color);
-                if sep_resp.hovered() || sep_resp.dragged() {
-                    ui.ctx().set_cursor_icon(egui::CursorIcon::ResizeHorizontal);
-                }
-                if sep_resp.dragged() {
-                    *ratio = (*ratio + sep_resp.drag_delta().x / avail.x).clamp(0.1, 0.9);
-                }
+                    let left_resp = ui.allocate_ui(Vec2::new(left_w, avail.y), |ui| {
+                        Self::render_pane_tree(ui, left, active_pane, terminal_buffers, pane_states, font_size, session_manager, rt)
+                    });
+                    merge_pane_result(&mut result, left_resp.inner);
 
-                let right_resp = ui.allocate_ui(Vec2::new(right_w, avail.y), |ui| {
-                    Self::render_pane_tree(ui, right, active_pane, terminal_buffers, pane_states, font_size, session_manager, rt)
+                    let (sep_rect, sep_resp) = ui.allocate_exact_size(Vec2::new(SEP, avail.y), egui::Sense::drag());
+                    let sep_color = if sep_resp.hovered() || sep_resp.dragged() { Ds::ACCENT } else { Ds::BORDER };
+                    ui.painter().rect_filled(sep_rect, CornerRadius::ZERO, sep_color);
+                    if sep_resp.hovered() || sep_resp.dragged() {
+                        ui.ctx().set_cursor_icon(egui::CursorIcon::ResizeHorizontal);
+                    }
+                    if sep_resp.dragged() {
+                        *ratio = (*ratio + sep_resp.drag_delta().x / avail.x).clamp(0.1, 0.9);
+                    }
+
+                    let right_resp = ui.allocate_ui(Vec2::new(right_w, avail.y), |ui| {
+                        Self::render_pane_tree(ui, right, active_pane, terminal_buffers, pane_states, font_size, session_manager, rt)
+                    });
+                    merge_pane_result(&mut result, right_resp.inner);
                 });
-                merge_pane_result(&mut result, right_resp.inner);
 
                 result
             }
@@ -487,9 +554,11 @@ impl NsrApp {
                 self.hosts.push(h);
                 self.persist_hosts();
             }
+            VaultAction::NewBlank => {
+                self.connect_dialog.open_blank();
+            }
             VaultAction::Edit(host) => {
-                self.vault_panel.editing_host = Some(host);
-                self.vault_panel.show_add_dialog = true;
+                self.connect_dialog.open_with_host(&host);
             }
             VaultAction::Export | VaultAction::Import => {}
         }
@@ -499,6 +568,8 @@ impl NsrApp {
         if let Some(ref s) = self.vault_store {
             match s.save_hosts(&self.hosts) {
                 Ok(()) => {
+                    // Atualiza mtime para não detectar a própria escrita como mudança externa
+                    self.ssh_config_mtime = s.ssh_config_mtime();
                     self.status_message = format!("{} hosts salvos", self.hosts.len());
                     self.status_ok = true;
                 }
@@ -618,6 +689,44 @@ impl NsrApp {
         });
     }
 
+    fn detach_active_pane(&mut self) {
+        let Some(tab_id) = self.active_tab else { return };
+        let Some(tab_idx) = self.tabs.iter().position(|t| t.id == tab_id) else { return };
+        let active_pane = self.tabs[tab_idx].active_pane;
+
+        // Só faz sentido se o tab tem split (mais de um pane)
+        let sessions = self.tabs[tab_idx].pane_tree.sessions();
+        if sessions.len() <= 1 { return; }
+
+        // Remove o pane da árvore atual
+        let old_tree = std::mem::replace(
+            &mut self.tabs[tab_idx].pane_tree,
+            PaneTree::Terminal(active_pane),
+        );
+        if let Some(new_tree) = old_tree.close_pane(active_pane) {
+            self.tabs[tab_idx].pane_tree = new_tree;
+            let remaining = self.tabs[tab_idx].pane_tree.sessions();
+            if let Some(&first) = remaining.first() {
+                self.tabs[tab_idx].active_pane = first;
+            }
+        }
+
+        // Cria nova aba com esse pane
+        let host_alias = self.hosts.iter()
+            .find(|h| {
+                if let Some(buf) = self.terminal_buffers.get(&active_pane) {
+                    let _ = buf; true
+                } else { false }
+            })
+            .map(|h| h.alias.clone())
+            .unwrap_or_else(|| format!("pane-{}", &active_pane.to_string()[..4]));
+
+        let new_tab = crate::pane::Tab::new(host_alias.clone(), &host_alias, active_pane);
+        let new_tab_id = new_tab.id;
+        self.tabs.push(new_tab);
+        self.active_tab = Some(new_tab_id);
+    }
+
     fn reconnect_session(&mut self, old_sid: Uuid, tab_idx: usize) {
         // Descobre o host pelo alias da aba
         let host_alias = self.tabs[tab_idx].host_alias.clone();
@@ -735,58 +844,143 @@ impl NsrApp {
         }
     }
 
-    fn show_welcome(&self, ui: &mut egui::Ui) {
-        ui.centered_and_justified(|ui| {
-            ui.vertical_centered(|ui| {
-                ui.add_space(60.0);
+    fn show_welcome(&mut self, ui: &mut egui::Ui) {
+        let avail = ui.available_rect_before_wrap();
 
-                // Logo
-                let logo_rect = Rect::from_center_size(
-                    Pos2::new(ui.available_rect_before_wrap().center().x, ui.cursor().top() + 40.0),
-                    Vec2::new(72.0, 72.0),
-                );
-                ui.painter().rect_filled(logo_rect, CornerRadius::same(16), Ds::ACCENT_DIM);
-                ui.painter().text(
-                    logo_rect.center(),
-                    egui::Align2::CENTER_CENTER,
-                    ">_",
-                    egui::FontId::monospace(24.0),
-                    Ds::ACCENT,
-                );
-                ui.add_space(80.0);
+        // ── Header ────────────────────────────────────────────────────────
+        ui.vertical_centered(|ui| {
+            ui.add_space(32.0);
 
-                ui.label(
-                    RichText::new("NSR-SSH")
-                        .size(32.0)
-                        .color(Ds::TEXT_PRIMARY)
-                        .strong(),
-                );
-                ui.add_space(Ds::SPACE_XS);
-                ui.label(
-                    RichText::new("No Subscription Required")
-                        .size(Ds::FONT_MD)
-                        .color(Ds::TEXT_MUTED),
-                );
+            // Logo
+            let logo_rect = Rect::from_center_size(
+                Pos2::new(avail.center().x, ui.cursor().top() + 32.0),
+                Vec2::new(56.0, 56.0),
+            );
+            ui.painter().rect_filled(logo_rect, CornerRadius::same(14), Ds::ACCENT_DIM);
+            ui.painter().text(
+                logo_rect.center(),
+                egui::Align2::CENTER_CENTER,
+                ">_",
+                egui::FontId::monospace(20.0),
+                Ds::ACCENT,
+            );
+            ui.add_space(64.0);
 
-                ui.add_space(Ds::SPACE_XL);
+            ui.label(RichText::new("NSR-SSH").size(28.0).color(Ds::TEXT_PRIMARY).strong());
+            ui.add_space(4.0);
+            ui.label(RichText::new("No Subscription Required").size(Ds::FONT_MD).color(Ds::TEXT_MUTED));
+            ui.add_space(Ds::SPACE_LG);
 
-                // Quick actions
-                ui.horizontal_centered(|ui| {
-                    quick_action_card(ui, "⚡", "Nova Conexão", "Ctrl+T");
-                    ui.add_space(Ds::SPACE_MD);
-                    quick_action_card(ui, "📋", "Abrir Vault", "Ctrl+B");
-                    ui.add_space(Ds::SPACE_MD);
-                    quick_action_card(ui, "⚙", "Configurações", "Ctrl+,");
-                });
+            // ── Quick actions ─────────────────────────────────────────────
+            ui.horizontal(|ui| {
+                // centralizar manualmente
+                let card_w = 120.0;
+                let n = 3;
+                let gap = Ds::SPACE_MD;
+                let total = card_w * n as f32 + gap * (n - 1) as f32;
+                ui.add_space((avail.width() - total) * 0.5);
 
-                ui.add_space(Ds::SPACE_XL);
-                ui.label(
-                    RichText::new(format!("v0.1.0  •  {} hosts salvos", 0))
-                        .size(Ds::FONT_SM)
-                        .color(Ds::TEXT_MUTED),
+                if quick_action_card(ui, "⚡", "Nova Conexão", "Ctrl+T", card_w).clicked() {
+                    self.connect_dialog.open_blank();
+                }
+                ui.add_space(gap);
+                if quick_action_card(ui, "☰", "Mostrar Vault", "Ctrl+B", card_w).clicked() {
+                    self.show_vault = !self.show_vault;
+                }
+                ui.add_space(gap);
+                if quick_action_card(ui, "⚙", "Configurações", "Ctrl+,", card_w).clicked() {
+                    self.settings.open = true;
+                }
+            });
+
+            ui.add_space(Ds::SPACE_XL);
+        });
+
+        // ── Lista de hosts recentes ───────────────────────────────────────
+        if !self.hosts.is_empty() {
+            ui.separator();
+            ui.add_space(Ds::SPACE_SM);
+
+            ui.horizontal(|ui| {
+                ui.add_space(Ds::SPACE_LG);
+                ui.label(RichText::new("HOSTS SALVOS").color(Ds::TEXT_MUTED).size(Ds::FONT_XS).strong());
+            });
+            ui.add_space(Ds::SPACE_XS);
+
+            // Campo de pesquisa
+            ui.horizontal(|ui| {
+                ui.add_space(Ds::SPACE_LG);
+                ui.add(
+                    egui::TextEdit::singleline(&mut self.welcome_search)
+                        .hint_text("🔍  buscar hosts...")
+                        .font(egui::FontId::proportional(Ds::FONT_SM))
+                        .desired_width(320.0)
+                        .margin(egui::Margin::symmetric(Ds::SPACE_SM as i8, Ds::SPACE_XS as i8)),
                 );
             });
-        });
+            ui.add_space(Ds::SPACE_SM);
+
+            let query = self.welcome_search.to_lowercase();
+            let filtered: Vec<_> = self.hosts.iter()
+                .filter(|h| query.is_empty()
+                    || h.alias.to_lowercase().contains(&query)
+                    || h.hostname.to_lowercase().contains(&query))
+                .cloned()
+                .collect();
+
+            egui::ScrollArea::vertical()
+                .max_height(avail.height() * 0.4)
+                .show(ui, |ui| {
+                    for host in filtered {
+                        ui.add_space(Ds::SPACE_XS);
+                        ui.horizontal(|ui| {
+                            ui.add_space(Ds::SPACE_LG);
+
+                            // Aloca área com sense para capturar cliques
+                            let desired = Vec2::new(ui.available_width() - Ds::SPACE_LG, 36.0);
+                            let (rect, resp) = ui.allocate_exact_size(desired, egui::Sense::click());
+
+                            if ui.is_rect_visible(rect) {
+                                let hovered = resp.hovered();
+                                let fill = if hovered { Ds::BG_ACTIVE } else { Ds::BG_SURFACE };
+                                let border = if hovered { Ds::ACCENT } else { Ds::BORDER };
+                                ui.painter().rect_filled(rect, Ds::R_SM, fill);
+                                ui.painter().rect_stroke(rect, Ds::R_SM, Stroke::new(1.0, border), egui::StrokeKind::Inside);
+
+                                // ">_" ícone
+                                ui.painter().text(
+                                    Pos2::new(rect.left() + 10.0, rect.center().y),
+                                    egui::Align2::LEFT_CENTER,
+                                    ">_",
+                                    egui::FontId::monospace(Ds::FONT_SM),
+                                    Ds::ACCENT,
+                                );
+                                // alias
+                                ui.painter().text(
+                                    Pos2::new(rect.left() + 32.0, rect.center().y),
+                                    egui::Align2::LEFT_CENTER,
+                                    &host.alias,
+                                    egui::FontId::proportional(Ds::FONT_MD),
+                                    Ds::TEXT_PRIMARY,
+                                );
+                                // user@host:port
+                                let conn_str = format!("{}@{}:{}", host.user, host.hostname, host.port);
+                                ui.painter().text(
+                                    Pos2::new(rect.right() - 8.0, rect.center().y),
+                                    egui::Align2::RIGHT_CENTER,
+                                    &conn_str,
+                                    egui::FontId::monospace(Ds::FONT_SM),
+                                    Ds::TEXT_MUTED,
+                                );
+                            }
+
+                            if resp.clicked() {
+                                self.connect_to_host(host.clone());
+                            }
+                        });
+                    }
+                });
+        }
     }
 }
 
@@ -797,6 +991,7 @@ impl eframe::App for NsrApp {
 
         self.process_session_events();
         self.drain_output_receivers();
+        self.check_ssh_config_changes();
 
         Ds::apply_global_visuals(&ctx);
 
@@ -814,7 +1009,7 @@ impl eframe::App for NsrApp {
             ));
 
         if close_pane { self.close_active_pane(); }
-        if open_new { self.connect_dialog.open = true; }
+        if open_new { self.connect_dialog.open_blank(); }
         if toggle_vault { self.show_vault = !self.show_vault; }
         if toggle_settings { self.settings.open = !self.settings.open; }
         if split_h { self.split_active_h(); }
@@ -844,11 +1039,14 @@ impl eframe::App for NsrApp {
                     match action {
                         TabBarAction::Activate(id) => self.active_tab = Some(id),
                         TabBarAction::Close(id) => self.close_tab(id),
-                        TabBarAction::New => self.connect_dialog.open = true,
+                        TabBarAction::New => self.connect_dialog.open_blank(),
                         TabBarAction::Duplicate(id) => self.duplicate_tab(id),
                         TabBarAction::OpenSettings => self.settings.open = true,
                         TabBarAction::SplitH(_) => self.split_active_h(),
                         TabBarAction::SplitV(_) => self.split_active_v(),
+                        TabBarAction::StartDrag(id) => self.dragging_tab = Some(id),
+                        TabBarAction::EndDrag => { /* handled by CentralPanel drop logic */ }
+                        TabBarAction::DetachPane(_) => self.detach_active_pane(),
                     }
                 }
             });
@@ -875,9 +1073,23 @@ impl eframe::App for NsrApp {
                     ui.label(RichText::new(&self.status_message).size(Ds::FONT_SM).color(Ds::TEXT_SECONDARY));
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                         ui.add_space(Ds::SPACE_SM);
-                        ui.label(RichText::new(format!("{} sessões", self.tabs.len())).size(Ds::FONT_SM).color(Ds::TEXT_MUTED));
-                        ui.add_space(Ds::SPACE_SM);
-                        ui.label(RichText::new(&self.theme.name).size(Ds::FONT_SM).color(Ds::TEXT_MUTED));
+                        ui.label(RichText::new(format!("{} sessões  •  {} hosts", self.tabs.len(), self.hosts.len())).size(Ds::FONT_SM).color(Ds::TEXT_MUTED));
+                        // Stats da sessão ativa
+                        if let Some(active_id) = self.active_tab {
+                            if let Some(tab) = self.tabs.iter().find(|t| t.id == active_id) {
+                                let active_pane = tab.active_pane;
+                                // ID abreviado da sessão
+                                let short_id = &active_pane.to_string()[..8];
+                                ui.add_space(Ds::SPACE_SM);
+                                ui.label(RichText::new(format!("ID:{}", short_id)).size(Ds::FONT_SM).color(Ds::TEXT_MUTED).family(egui::FontFamily::Monospace));
+                                // Tempo online
+                                if let Some(connected_at) = self.session_connected_at.get(&active_pane) {
+                                    let uptime = format_duration(connected_at.elapsed());
+                                    ui.add_space(Ds::SPACE_SM);
+                                    ui.label(RichText::new(format!("⏱ {}", uptime)).size(Ds::FONT_SM).color(Ds::TEXT_MUTED));
+                                }
+                            }
+                        }
                         ui.add_space(Ds::SPACE_SM);
                     });
                 });
@@ -898,15 +1110,24 @@ impl eframe::App for NsrApp {
 
         // ── Dialogs ──────────────────────────────────────────────────────────
         if let Some(req) = self.connect_dialog.show_window(&ctx) {
-            self.connect_to_host_with_password(req.host, req.password);
+            if req.save_to_vault {
+                self.handle_vault_action(VaultAction::Save(req.host.clone()));
+            }
+            if req.connect {
+                self.connect_to_host_with_password(req.host, req.password);
+            }
         }
         if self.settings.open {
             self.settings.show_window(&ctx, &mut self.theme);
         }
 
         // ── Central panel ────────────────────────────────────────────────────
-        egui::CentralPanel::default().show(&ctx, |ui| {
+        egui::CentralPanel::default()
+            .frame(egui::Frame::new())
+            .show(&ctx, |ui| {
             let bg = ui.available_rect_before_wrap();
+            // Captura o rect ANTES de renderizar qualquer coisa (sem margens do Frame padrão)
+            let central_rect = bg;
             ui.painter().rect_filled(bg, CornerRadius::ZERO, Ds::BG_BASE);
 
             if self.tabs.is_empty() {
@@ -944,9 +1165,151 @@ impl eframe::App for NsrApp {
                     if let Some(_sid) = result.close_pane {
                         self.close_active_pane();
                     }
+                    if result.split_h.is_some() {
+                        self.split_active_h();
+                    }
+                    if result.split_v.is_some() {
+                        self.split_active_v();
+                    }
+
+                    // ── Zonas de drop quando há aba sendo arrastada ──────────
+                    if let Some(drag_id) = self.dragging_tab {
+                        // Mostra zonas mesmo arrastando a aba ativa, mas só se há mais de 1 tab OU
+                        // o tab ativo tem split (para mover pane para nova posição na mesma tab)
+                        let has_multiple_tabs = self.tabs.len() > 1;
+                        let is_different_tab = drag_id != active_id;
+                        if is_different_tab || has_multiple_tabs {
+                            let r = central_rect;
+                            let pointer_pos = ctx.input(|i| i.pointer.hover_pos());
+                            let mouse_released = ctx.input(|i| i.pointer.any_released());
+                            let painter = ctx.layer_painter(egui::LayerId::new(
+                                egui::Order::Foreground,
+                                egui::Id::new("drop_zones"),
+                            ));
+
+                            // Determina zona pelo quadrante sem sobreposição:
+                            // divide o rect em 4 triângulos pelas diagonais
+                            let hovered_side = pointer_pos.and_then(|p| {
+                                if !r.contains(p) { return None; }
+                                let dx = p.x - r.center().x;  // + = direita
+                                let dy = p.y - r.center().y;  // + = baixo
+                                // Escala para comparação normalizada
+                                let nx = dx / (r.width() * 0.5);
+                                let ny = dy / (r.height() * 0.5);
+                                if nx.abs() > ny.abs() {
+                                    if nx > 0.0 { Some("right") } else { Some("left") }
+                                } else {
+                                    if ny > 0.0 { Some("bottom") } else { Some("top") }
+                                }
+                            });
+
+                            let zone_depth = 0.35; // 35% do lado como preview
+                            let zones: &[(&str, Rect, &str)] = &[
+                                ("↑  Cima",    Rect::from_min_max(r.min, Pos2::new(r.max.x, r.min.y + r.height() * zone_depth)), "top"),
+                                ("↓  Baixo",   Rect::from_min_max(Pos2::new(r.min.x, r.max.y - r.height() * zone_depth), r.max), "bottom"),
+                                ("←  Esquerda",Rect::from_min_max(r.min, Pos2::new(r.min.x + r.width() * zone_depth, r.max.y)), "left"),
+                                ("→  Direita", Rect::from_min_max(Pos2::new(r.max.x - r.width() * zone_depth, r.min.y), r.max), "right"),
+                            ];
+
+                            for (label, zone_rect, side) in zones {
+                                let active = hovered_side == Some(side);
+                                let fill = if active {
+                                    egui::Color32::from_rgba_premultiplied(
+                                        Ds::ACCENT.r(), Ds::ACCENT.g(), Ds::ACCENT.b(), 110,
+                                    )
+                                } else {
+                                    egui::Color32::from_rgba_premultiplied(80, 80, 120, 40)
+                                };
+                                painter.rect_filled(*zone_rect, egui::epaint::CornerRadius::ZERO, fill);
+                                if active {
+                                    painter.rect_stroke(
+                                        *zone_rect,
+                                        egui::epaint::CornerRadius::ZERO,
+                                        egui::Stroke::new(2.0, Ds::ACCENT),
+                                        egui::StrokeKind::Inside,
+                                    );
+                                }
+                                painter.text(
+                                    zone_rect.center(),
+                                    egui::Align2::CENTER_CENTER,
+                                    label,
+                                    egui::FontId::proportional(if active { 16.0 } else { 13.0 }),
+                                    if active { egui::Color32::WHITE } else { egui::Color32::from_white_alpha(100) },
+                                );
+
+                                if active && mouse_released {
+                                    // Não pode arrastar aba para si mesma sem split
+                                    if drag_id != active_id {
+                                        if let Some(drag_tab_idx) = self.tabs.iter().position(|t| t.id == drag_id) {
+                                            // Captura tudo por valor antes de qualquer mutação
+                                            let drag_session = self.tabs[drag_tab_idx].active_pane;
+                                            let dest_id = active_id; // ID estável, não índice
+
+                                            // Remove aba arrastada primeiro
+                                            self.tabs.remove(drag_tab_idx);
+
+                                            // Reindexar pelo ID, que é estável
+                                            if let Some(dest_idx) = self.tabs.iter().position(|t| t.id == dest_id) {
+                                                let dest_session = self.tabs[dest_idx].active_pane;
+                                                let old_tree = std::mem::replace(
+                                                    &mut self.tabs[dest_idx].pane_tree,
+                                                    PaneTree::Terminal(dest_session),
+                                                );
+                                                self.tabs[dest_idx].pane_tree = match *side {
+                                                    "left"   => PaneTree::HSplit { ratio: 0.5, left:  Box::new(PaneTree::Terminal(drag_session)), right: Box::new(old_tree) },
+                                                    "right"  => PaneTree::HSplit { ratio: 0.5, left:  Box::new(old_tree), right: Box::new(PaneTree::Terminal(drag_session)) },
+                                                    "top"    => PaneTree::VSplit { ratio: 0.5, top:   Box::new(PaneTree::Terminal(drag_session)), bottom: Box::new(old_tree) },
+                                                    _        => PaneTree::VSplit { ratio: 0.5, top:   Box::new(old_tree), bottom: Box::new(PaneTree::Terminal(drag_session)) },
+                                                };
+                                                self.tabs[dest_idx].active_pane = drag_session;
+                                                self.active_tab = Some(dest_id);
+
+                                                // Envia resize imediato para as duas sessões com ~metade das colunas/linhas
+                                                // para que o shell redesenhe antes do próximo frame (minimiza "flash" preto)
+                                                let font_size = self.settings.font_size;
+                                                let char_w = font_size * 0.601;
+                                                let char_h = font_size * 1.25;
+                                                let half_cols = ((central_rect.width() * 0.5 / char_w) as u16).max(10);
+                                                let half_rows = ((central_rect.height() / char_h) as u16).max(4);
+                                                let sm = self.session_manager.clone();
+                                                let rt = self.rt.clone();
+                                                let ds = drag_session;
+                                                let dest_s = dest_session;
+                                                rt.block_on(async {
+                                                    sm.resize(ds, half_cols, half_rows).await;
+                                                    sm.resize(dest_s, half_cols, half_rows).await;
+                                                });
+                                                // Atualiza buffers locais para não disparar resize duplo no próximo frame
+                                                if let Some(buf) = self.terminal_buffers.get(&ds) {
+                                                    if let Ok(mut b) = buf.lock() { b.resize(half_cols as usize, half_rows as usize); }
+                                                }
+                                                if let Some(buf) = self.terminal_buffers.get(&dest_s) {
+                                                    if let Ok(mut b) = buf.lock() { b.resize(half_cols as usize, half_rows as usize); }
+                                                }
+                                            }
+                                        }
+                                    }
+                                    self.dragging_tab = None;
+                                }
+                            }
+
+                            // Cancela drag se soltar fora de qualquer zona
+                            if mouse_released && hovered_side.is_none() {
+                                self.dragging_tab = None;
+                            }
+                        }
+                    }
                 }
             }
         });
+
+        // Fallback: limpa drag se mouse foi solto fora de qualquer zona de drop
+        if self.dragging_tab.is_some() {
+            let mouse_down = ctx.input(|i| i.pointer.primary_down());
+            if !mouse_down {
+                self.dragging_tab = None;
+            }
+        }
 
         ctx.request_repaint();
     }
@@ -977,32 +1340,49 @@ fn merge_pane_result(dst: &mut PaneResult, src: PaneResult) {
     if src.toggle_recording.is_some() { dst.toggle_recording = src.toggle_recording; }
     if src.reconnect.is_some() { dst.reconnect = src.reconnect; }
     if src.close_pane.is_some() { dst.close_pane = src.close_pane; }
+    if src.split_h.is_some() { dst.split_h = src.split_h; }
+    if src.split_v.is_some() { dst.split_v = src.split_v; }
 }
 
-fn quick_action_card(ui: &mut egui::Ui, icon: &str, label: &str, shortcut: &str) {
-    let card_w = 130.0;
-    let card_h = 80.0;
+fn quick_action_card(ui: &mut egui::Ui, icon: &str, label: &str, shortcut: &str, width: f32) -> egui::Response {
+    let card_h = 76.0;
+    let sense = egui::Sense::click();
+    let (rect, resp) = ui.allocate_exact_size(Vec2::new(width, card_h), sense);
 
-    egui::Frame::new()
-        .fill(Ds::BG_SURFACE)
-        .stroke(Stroke::new(1.0, Ds::BORDER))
-        .corner_radius(Ds::R_MD)
-        .inner_margin(egui::Margin::same(Ds::SPACE_SM as i8))
-        .show(ui, |ui| {
-            ui.set_min_size(Vec2::new(card_w, card_h));
-            ui.vertical_centered(|ui| {
-                ui.label(RichText::new(icon).size(20.0));
-                ui.add_space(4.0);
-                ui.label(RichText::new(label).color(Ds::TEXT_PRIMARY).size(Ds::FONT_SM).strong());
-                ui.add_space(2.0);
-                ui.label(
-                    RichText::new(shortcut)
-                        .color(Ds::TEXT_MUTED)
-                        .size(Ds::FONT_XS)
-                        .family(egui::FontFamily::Monospace),
-                );
-            });
-        });
+    if ui.is_rect_visible(rect) {
+        let hovered = resp.hovered();
+        let fill = if hovered { Ds::BG_ACTIVE } else { Ds::BG_SURFACE };
+        let border = if hovered { Ds::ACCENT } else { Ds::BORDER };
+        ui.painter().rect_filled(rect, Ds::R_MD, fill);
+        ui.painter().rect_stroke(rect, Ds::R_MD, Stroke::new(1.0, border), egui::StrokeKind::Inside);
+
+        // ícone
+        ui.painter().text(
+            Pos2::new(rect.center().x, rect.top() + 20.0),
+            egui::Align2::CENTER_TOP,
+            icon,
+            egui::FontId::proportional(18.0),
+            if hovered { Ds::ACCENT } else { Ds::TEXT_SECONDARY },
+        );
+        // label
+        ui.painter().text(
+            Pos2::new(rect.center().x, rect.top() + 42.0),
+            egui::Align2::CENTER_TOP,
+            label,
+            egui::FontId::proportional(Ds::FONT_SM),
+            Ds::TEXT_PRIMARY,
+        );
+        // shortcut
+        ui.painter().text(
+            Pos2::new(rect.center().x, rect.top() + 58.0),
+            egui::Align2::CENTER_TOP,
+            shortcut,
+            egui::FontId::monospace(Ds::FONT_XS),
+            Ds::TEXT_MUTED,
+        );
+    }
+
+    resp
 }
 
 fn key_to_bytes(key: Key, modifiers: Modifiers) -> Vec<u8> {
@@ -1067,5 +1447,16 @@ fn key_to_bytes(key: Key, modifiers: Modifiers) -> Vec<u8> {
         Key::F11 => vec![0x1b, b'[', b'2', b'3', b'~'],
         Key::F12 => vec![0x1b, b'[', b'2', b'4', b'~'],
         _ => vec![],
+    }
+}
+
+fn format_duration(d: Duration) -> String {
+    let s = d.as_secs();
+    if s < 60 {
+        format!("{:02}s", s)
+    } else if s < 3600 {
+        format!("{:02}:{:02}", s / 60, s % 60)
+    } else {
+        format!("{:02}:{:02}:{:02}", s / 3600, (s % 3600) / 60, s % 60)
     }
 }

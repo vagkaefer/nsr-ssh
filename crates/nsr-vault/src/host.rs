@@ -12,6 +12,8 @@ pub struct Host {
     pub identity_file: Option<String>,
     pub tags: Vec<String>,
     pub description: Option<String>,
+    #[serde(default)]
+    pub ssh_options: Option<String>,
 }
 
 impl Host {
@@ -25,6 +27,7 @@ impl Host {
             identity_file: None,
             tags: Vec::new(),
             description: None,
+            ssh_options: None,
         }
     }
 

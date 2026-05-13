@@ -1,4 +1,5 @@
 use std::path::PathBuf;
+use std::time::SystemTime;
 use anyhow::{Context, Result};
 use tracing::debug;
 use crate::host::Host;
@@ -89,6 +90,19 @@ impl VaultStore {
         Ok(hosts)
     }
 
+    pub fn ssh_config_mtime(&self) -> Option<SystemTime> {
+        std::fs::metadata(&self.ssh_config_path).ok()?.modified().ok()
+    }
+
+    /// Hosts do ~/.ssh/config que ainda não existem no vault (por alias).
+    pub fn new_hosts_from_ssh_config(&self, existing: &[Host]) -> Result<Vec<Host>> {
+        let imported = self.import_from_ssh_config()?;
+        Ok(imported
+            .into_iter()
+            .filter(|h| !existing.iter().any(|e| e.alias == h.alias))
+            .collect())
+    }
+
     fn read_non_nsr_blocks(&self) -> String {
         if !self.ssh_config_path.exists() {
             return String::new();
@@ -147,6 +161,7 @@ pub fn parse_ssh_config(content: &str) -> Vec<Host> {
                     identity_file: None,
                     tags: Vec::new(),
                     description: None,
+                    ssh_options: None,
                 });
             }
             "hostname" => {

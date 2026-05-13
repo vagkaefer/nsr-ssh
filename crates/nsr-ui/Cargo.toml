@@ -19,3 +19,4 @@ serde = { workspace = true }
 arboard = { workspace = true }
 chrono = { workspace = true }
 dirs = { workspace = true }
+rfd = { workspace = true }

@@ -35,13 +35,27 @@ impl SettingsPanel {
             return;
         }
 
+        // Overlay escuro
+        egui::Area::new(egui::Id::new("settings_overlay"))
+            .fixed_pos(egui::pos2(0.0, 0.0))
+            .order(egui::Order::Background)
+            .show(ctx, |ui| {
+                let screen = ctx.content_rect();
+                ui.painter().rect_filled(
+                    screen,
+                    egui::epaint::CornerRadius::ZERO,
+                    Color32::from_black_alpha(140),
+                );
+            });
+
         let mut should_close = false;
 
-        egui::Window::new("Configurações")
+        egui::Window::new("##settings_dialog")
+            .title_bar(false)
             .collapsible(false)
-            .resizable(true)
+            .resizable(false)
             .anchor(egui::Align2::CENTER_CENTER, Vec2::ZERO)
-            .fixed_size(Vec2::new(600.0, 420.0))
+            .fixed_size(Vec2::new(640.0, 440.0))
             .frame(
                 egui::Frame::window(&ctx.global_style())
                     .fill(Ds::BG_SURFACE)
@@ -51,42 +65,39 @@ impl SettingsPanel {
             )
             .show(ctx, |ui| {
                 // ── Titlebar ───────────────────────────────────────────────
-                ui.horizontal(|ui| {
-                    ui.add_space(Ds::SPACE_LG);
-                    ui.add_space(0.0);
-                    let _area = egui::Frame::new()
-                        .fill(Ds::BG_PANEL)
-                        .inner_margin(egui::Margin::symmetric(Ds::SPACE_LG as i8, Ds::SPACE_MD as i8))
-                        .show(ui, |ui| {
-                            ui.set_min_size(Vec2::new(ui.available_width(), 0.0));
-                            ui.horizontal(|ui| {
-                                ui.label(
-                                    RichText::new("Configurações")
-                                        .size(Ds::FONT_LG)
-                                        .color(Ds::TEXT_PRIMARY)
-                                        .strong(),
-                                );
-                                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                                    if ui.add(
-                                        egui::Button::new(RichText::new("×").size(18.0).color(Ds::TEXT_MUTED))
-                                            .fill(Color32::TRANSPARENT)
-                                            .stroke(Stroke::NONE),
-                                    ).clicked() {
-                                        should_close = true;
-                                    }
-                                });
+                egui::Frame::new()
+                    .fill(Ds::BG_PANEL)
+                    .inner_margin(egui::Margin::symmetric(Ds::SPACE_LG as i8, Ds::SPACE_MD as i8))
+                    .show(ui, |ui| {
+                        ui.set_min_size(Vec2::new(640.0, 0.0));
+                        ui.horizontal(|ui| {
+                            ui.label(
+                                RichText::new("Configurações")
+                                    .size(Ds::FONT_LG)
+                                    .color(Ds::TEXT_PRIMARY)
+                                    .strong(),
+                            );
+                            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                                if ui.add(
+                                    egui::Button::new(RichText::new("×").size(20.0).color(Ds::TEXT_MUTED))
+                                        .fill(Color32::TRANSPARENT)
+                                        .stroke(Stroke::NONE),
+                                ).clicked() {
+                                    should_close = true;
+                                }
                             });
                         });
-                });
+                    });
 
                 // ── Layout: sidebar + content ──────────────────────────────
                 ui.horizontal(|ui| {
-                    // Sidebar com seções
+                    // Sidebar
                     egui::Frame::new()
                         .fill(Ds::BG_PANEL)
-                        .inner_margin(egui::Margin::symmetric(Ds::SPACE_SM as i8, Ds::SPACE_SM as i8))
+                        .inner_margin(egui::Margin::symmetric(Ds::SPACE_SM as i8, Ds::SPACE_MD as i8))
                         .show(ui, |ui| {
-                            ui.set_min_size(Vec2::new(140.0, 340.0));
+                            ui.set_min_size(Vec2::new(148.0, 380.0));
+                            ui.set_max_size(Vec2::new(148.0, 380.0));
                             ui.vertical(|ui| {
                                 settings_nav(ui, "Aparência", Section::Appearance, &mut self.active_section);
                                 settings_nav(ui, "Atalhos",   Section::Shortcuts,  &mut self.active_section);
@@ -95,17 +106,23 @@ impl SettingsPanel {
                             });
                         });
 
+                    // Conteúdo
                     egui::Frame::new()
                         .fill(Ds::BG_SURFACE)
                         .inner_margin(egui::Margin::same(Ds::SPACE_LG as i8))
                         .show(ui, |ui| {
-                            ui.set_min_size(Vec2::new(430.0, 340.0));
-                            match self.active_section {
-                                Section::Appearance => self.section_appearance(ui, current_theme),
-                                Section::Shortcuts  => section_shortcuts(ui),
-                                Section::Ssh        => section_ssh(ui),
-                                Section::Plugins    => section_plugins(ui),
-                            }
+                            ui.set_min_size(Vec2::new(472.0, 380.0));
+                            ui.set_max_size(Vec2::new(472.0, 380.0));
+                            egui::ScrollArea::vertical()
+                                .auto_shrink([false, false])
+                                .show(ui, |ui| {
+                                    match self.active_section {
+                                        Section::Appearance => self.section_appearance(ui, current_theme),
+                                        Section::Shortcuts  => section_shortcuts(ui),
+                                        Section::Ssh        => section_ssh(ui),
+                                        Section::Plugins    => section_plugins(ui),
+                                    }
+                                });
                         });
                 });
             });

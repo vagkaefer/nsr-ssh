@@ -10,8 +10,6 @@ use crate::design::Ds;
 pub struct VaultPanel {
     pub search: String,
     pub selected: Option<uuid::Uuid>,
-    pub show_add_dialog: bool,
-    pub editing_host: Option<Host>,
     pub hovered_host: Option<uuid::Uuid>,
 }
 
@@ -20,8 +18,6 @@ impl VaultPanel {
         Self {
             search: String::new(),
             selected: None,
-            show_add_dialog: false,
-            editing_host: None,
             hovered_host: None,
         }
     }
@@ -52,8 +48,7 @@ impl VaultPanel {
                     ui.add_space(Ds::SPACE_SM);
                     let add_btn = icon_button(ui, "+", "Novo host");
                     if add_btn.clicked() {
-                        self.show_add_dialog = true;
-                        self.editing_host = Some(Host::default());
+                        action = Some(VaultAction::NewBlank);
                     }
                 });
             });
@@ -187,61 +182,6 @@ impl VaultPanel {
                 if imp.clicked() { action = Some(VaultAction::Import); }
             });
         });
-
-        // ── Dialog de adicionar/editar ────────────────────────────────────────
-        if self.show_add_dialog {
-            if let Some(mut host) = self.editing_host.clone() {
-                let mut save = false;
-                let mut cancel = false;
-
-                egui::Window::new("Novo Host")
-                    .resizable(false)
-                    .collapsible(false)
-                    .anchor(egui::Align2::CENTER_CENTER, Vec2::ZERO)
-                    .fixed_size(Vec2::new(400.0, 0.0))
-                    .show(ui.ctx(), |ui| {
-                        host_form(ui, &mut host);
-                        ui.add_space(Ds::SPACE_MD);
-                        ui.separator();
-                        ui.add_space(Ds::SPACE_SM);
-                        let can_save = !host.alias.trim().is_empty() && !host.hostname.trim().is_empty();
-                        ui.horizontal(|ui| {
-                            let btn_save = ui.add_enabled(
-                                can_save,
-                                egui::Button::new(
-                                    RichText::new("Salvar").color(egui::Color32::WHITE).size(Ds::FONT_MD).strong(),
-                                )
-                                .fill(if can_save { Ds::ACCENT } else { Ds::BG_ACTIVE })
-                                .stroke(egui::Stroke::NONE)
-                                .corner_radius(Ds::R_SM),
-                            );
-                            if btn_save.clicked() { save = true; }
-                            ui.add_space(Ds::SPACE_XS);
-                            let btn_cancel = ghost_button(ui, "Cancelar");
-                            if btn_cancel.clicked() { cancel = true; }
-                            if !can_save {
-                                ui.add_space(Ds::SPACE_SM);
-                                ui.label(
-                                    RichText::new("Nome e HostName são obrigatórios")
-                                        .color(Ds::RED)
-                                        .size(Ds::FONT_SM),
-                                );
-                            }
-                        });
-                    });
-
-                if save {
-                    action = Some(VaultAction::Save(host));
-                    self.show_add_dialog = false;
-                    self.editing_host = None;
-                } else if cancel {
-                    self.show_add_dialog = false;
-                    self.editing_host = None;
-                } else {
-                    self.editing_host = Some(host);
-                }
-            }
-        }
 
         action
     }
@@ -413,71 +353,6 @@ pub fn ghost_button(ui: &mut Ui, label: &str) -> egui::Response {
     )
 }
 
-fn host_form(ui: &mut Ui, host: &mut Host) {
-    ui.add_space(Ds::SPACE_SM);
-
-    form_field(ui, "Nome / Alias  (ex: prod-web)", |ui| {
-        ui.add(
-            egui::TextEdit::singleline(&mut host.alias)
-                .hint_text("meu-servidor")
-                .desired_width(f32::INFINITY),
-        );
-    });
-
-    form_field(ui, "HostName / IP", |ui| {
-        ui.add(
-            egui::TextEdit::singleline(&mut host.hostname)
-                .hint_text("192.168.1.1 ou servidor.exemplo.com")
-                .desired_width(f32::INFINITY),
-        );
-    });
-
-    ui.columns(2, |cols| {
-        form_field(&mut cols[0], "Usuário", |ui| {
-            ui.add(egui::TextEdit::singleline(&mut host.user).hint_text("ubuntu").desired_width(f32::INFINITY));
-        });
-        let mut port_str = host.port.to_string();
-        form_field(&mut cols[1], "Porta", |ui| {
-            if ui.add(egui::TextEdit::singleline(&mut port_str).hint_text("22").desired_width(f32::INFINITY)).changed() {
-                host.port = port_str.parse().unwrap_or(22);
-            }
-        });
-    });
-
-    let mut id_file = host.identity_file.clone().unwrap_or_default();
-    form_field(ui, "IdentityFile  (opcional)", |ui| {
-        if ui.add(egui::TextEdit::singleline(&mut id_file).hint_text("~/.ssh/id_rsa").desired_width(f32::INFINITY)).changed() {
-            host.identity_file = if id_file.is_empty() { None } else { Some(id_file.clone()) };
-        }
-    });
-
-    // Tags — separadas por vírgula ou espaço
-    let mut tags_str = host.tags.join(", ");
-    form_field(ui, "Tags  (separadas por vírgula)", |ui| {
-        if ui.add(egui::TextEdit::singleline(&mut tags_str).hint_text("producao, web, aws").desired_width(f32::INFINITY)).changed() {
-            host.tags = tags_str
-                .split([',', ' '])
-                .map(|t| t.trim().to_string())
-                .filter(|t| !t.is_empty())
-                .collect();
-        }
-    });
-
-    let mut desc = host.description.clone().unwrap_or_default();
-    form_field(ui, "Descrição  (opcional)", |ui| {
-        if ui.add(egui::TextEdit::singleline(&mut desc).hint_text("Servidor de produção principal").desired_width(f32::INFINITY)).changed() {
-            host.description = if desc.is_empty() { None } else { Some(desc.clone()) };
-        }
-    });
-}
-
-fn form_field(ui: &mut Ui, label: &str, content: impl FnOnce(&mut Ui)) {
-    ui.add_space(Ds::SPACE_XS);
-    ui.label(RichText::new(label).color(Ds::TEXT_SECONDARY).size(Ds::FONT_SM));
-    ui.add_space(2.0);
-    content(ui);
-    ui.add_space(Ds::SPACE_XS);
-}
 
 enum HostRowAction {
     Select,
@@ -491,6 +366,7 @@ enum HostRowAction {
 pub enum VaultAction {
     Connect(Host),
     Edit(Host),
+    NewBlank,
     Save(Host),
     Duplicate(Host),
     Delete(uuid::Uuid),
